@@ -5,6 +5,44 @@
 
 ---
 
+## [4.2.2] - 2026-03-02
+
+### 제거 (Removed)
+- **organize_files.sh 삭제**: 일회성 파일 정리 스크립트 제거
+  - v4.0.0에서 파일 정리 작업 이미 완료
+  - 파일명 불일치로 실행 시 오류 발생 (`monitor_data_health_v2.py` 없음)
+  - package.xml을 오래된 버전(v4.0.0)으로 덮어쓸 위험
+
+### 변경 (Changed)
+- **install.sh v4.2.1 업데이트**:
+  - 버전 표시: v4.0.0 → v4.2.1
+  - GitHub URL 수정: `your-repo/ur5e_rt_controller` → `hyujun/ur5e-rt-controller`
+  - organize_files.sh 호출 제거 (더 이상 불필요)
+  - 실행 파일명 수정: `monitor_data_health_v2.py` → `monitor_data_health.py`
+  - requirements.txt 사용: `pip3 install --user -r requirements.txt`
+  - chmod 명령 제거: CMakeLists.txt의 `install(PROGRAMS)`가 자동 처리
+  - **RT 권한 설정 추가** (v4.2.0+ 필수):
+    - realtime 그룹 생성 및 사용자 추가
+    - `/etc/security/limits.conf`에 rtprio 99, memlock unlimited 설정
+    - 로그아웃/로그인 안내 메시지
+
+### 개선 (Improved)
+- **install.sh Quick Start 섹션 확장**:
+  - 4개 Python 유틸리티 스크립트 모두 예제 포함
+    1. monitor_data_health.py
+    2. plot_ur_trajectory.py
+    3. motion_editor_gui.py
+    4. hand_udp_sender_example.py
+  - RT_OPTIMIZATION.md 참조 추가
+  - v4.2.0+ 병렬 컴퓨팅 설정 안내 추가
+
+### 사용자 영향
+- **신규 설치 시**: install.sh가 RT 권한 자동 설정
+- **기존 사용자**: 영향 없음 (organize_files.sh 이미 사용 안 함)
+- **Quick Start 가이드 개선**: 모든 유틸리티 스크립트 사용법 명확화
+
+---
+
 ## [4.2.1] - 2026-03-02
 
 ### 제거 (Removed)
@@ -14,8 +52,8 @@
   - entry_points 파일명 불일치 (`monitor_data_health_v2.py` 파일 없음)
 
 ### 변경 (Changed)
-- **CMakeLists.txt v4.2.0 업데이트**:
-  - VERSION: 4.0.0 → 4.2.0 (package.xml과 일치)
+- **CMakeLists.txt v4.2.1 업데이트**:
+  - VERSION: 4.0.0 → 4.2.1 (package.xml과 일치)
   - `install(PROGRAMS)` 섹션에 누락된 스크립트 2개 추가:
     - `scripts/motion_editor_gui.py`
     - `scripts/hand_udp_sender_example.py`
