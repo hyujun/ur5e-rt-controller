@@ -2,11 +2,15 @@
 #include "ur5e_rt_controller/controllers/pd_controller.hpp"
 #include "ur5e_rt_controller/data_logger.hpp"
 #include "ur5e_rt_controller/rt_controller_interface.hpp"
+#include "ur5e_rt_controller/thread_config.hpp"
+#include "ur5e_rt_controller/thread_utils.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+
+#include <sys/mman.h>  // mlockall
 
 #include <algorithm>
 #include <array>
@@ -15,16 +19,20 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 using namespace std::chrono_literals;
 namespace urtc = ur5e_rt_controller;
 
 // ── CustomController ───────────────────────────────────────────────────────────
 //
-// 500 Hz position controller node. Reads /joint_states and
-// /target_joint_positions, computes PD commands, and publishes to
-// /forward_position_controller/commands. A 50 Hz watchdog timer triggers
-// E-STOP if robot or hand data becomes stale.
+// 500 Hz position controller node with multi-threaded executors.
+// 
+// CallbackGroup assignment:
+//   - cb_group_rt_:     control_timer_, timeout_timer_  (RT core)
+//   - cb_group_sensor_: joint_state_sub_, target_sub_, hand_state_sub_  (Sensor core)
+//   - cb_group_log_:    logging operations  (non-RT core)
+//   - cb_group_aux_:    estop_pub_  (aux core)
 class CustomController : public rclcpp::Node {
  public:
   CustomController()
@@ -32,6 +40,7 @@ class CustomController : public rclcpp::Node {
         controller_(std::make_unique<urtc::PDController>()),
         logger_(std::make_unique<urtc::DataLogger>("/tmp/ur5e_control_log.csv"))
   {
+    CreateCallbackGroups();
     DeclareAndLoadParameters();
     CreateSubscriptions();
     CreatePublishers();
@@ -39,6 +48,7 @@ class CustomController : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(), "CustomController ready — %.0f Hz, E-STOP: %s",
                 control_rate_, enable_estop_ ? "ON" : "OFF");
+    RCLCPP_INFO(get_logger(), "CallbackGroups enabled: RT, Sensor, Log, Aux");
   }
 
   ~CustomController() override {
@@ -47,7 +57,25 @@ class CustomController : public rclcpp::Node {
     }
   }
 
+  // Public accessors for main() to retrieve callback groups
+  rclcpp::CallbackGroup::SharedPtr GetRtGroup()     const { return cb_group_rt_; }
+  rclcpp::CallbackGroup::SharedPtr GetSensorGroup() const { return cb_group_sensor_; }
+  rclcpp::CallbackGroup::SharedPtr GetLogGroup()    const { return cb_group_log_; }
+  rclcpp::CallbackGroup::SharedPtr GetAuxGroup()    const { return cb_group_aux_; }
+
  private:
+  // ── CallbackGroup creation ──────────────────────────────────────────────────
+  void CreateCallbackGroups() {
+    cb_group_rt_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_group_sensor_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_group_log_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_group_aux_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+  }
+
   // ── Initialisation helpers ──────────────────────────────────────────────────
   void DeclareAndLoadParameters() {
     declare_parameter("control_rate",    500.0);
@@ -75,26 +103,34 @@ class CustomController : public rclcpp::Node {
   }
 
   void CreateSubscriptions() {
+    // Assign subscriptions to cb_group_sensor_
+    auto sub_options = rclcpp::SubscriptionOptions();
+    sub_options.callback_group = cb_group_sensor_;
+
     joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         "/joint_states", 10,
         [this](sensor_msgs::msg::JointState::SharedPtr msg) {
           JointStateCallback(std::move(msg));
-        });
+        },
+        sub_options);
 
     target_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
         "/target_joint_positions", 10,
         [this](std_msgs::msg::Float64MultiArray::SharedPtr msg) {
           TargetCallback(std::move(msg));
-        });
+        },
+        sub_options);
 
     hand_state_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
         "/hand/joint_states", 10,
         [this](std_msgs::msg::Float64MultiArray::SharedPtr msg) {
           HandStateCallback(std::move(msg));
-        });
+        },
+        sub_options);
   }
 
   void CreatePublishers() {
+    // Publishers are thread-safe, but assign to aux group for clarity
     command_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
         "/forward_position_controller/commands", 10);
     estop_pub_ = create_publisher<std_msgs::msg::Bool>(
@@ -104,12 +140,18 @@ class CustomController : public rclcpp::Node {
   void CreateTimers() {
     const auto control_period = std::chrono::microseconds(
         static_cast<int>(1'000'000.0 / control_rate_));
+    
+    // Assign control_timer_ and timeout_timer_ to cb_group_rt_
     control_timer_ = create_wall_timer(
-        control_period, [this]() { ControlLoop(); });
+        control_period,
+        [this]() { ControlLoop(); },
+        cb_group_rt_);
 
     if (enable_estop_) {
       timeout_timer_ = create_wall_timer(
-          20ms, [this]() { CheckTimeouts(); });
+          20ms,
+          [this]() { CheckTimeouts(); },
+          cb_group_rt_);
     }
   }
 
@@ -139,7 +181,6 @@ class CustomController : public rclcpp::Node {
                   target_positions_.begin());
       target_received_ = true;
     }
-    // Forward target to controller via interface.
     controller_->SetRobotTarget(target_positions_);
   }
 
@@ -195,7 +236,6 @@ class CustomController : public rclcpp::Node {
       return;
     }
 
-    // Snapshot shared state under lock.
     urtc::ControllerState state{};
     {
       std::lock_guard lock(state_mutex_);
@@ -210,7 +250,6 @@ class CustomController : public rclcpp::Node {
 
     const urtc::ControllerOutput output = controller_->Compute(state);
 
-    // Publish command (zero on E-STOP is handled inside PDController::Compute).
     std_msgs::msg::Float64MultiArray cmd_msg;
     cmd_msg.data.assign(output.robot_commands.begin(),
                         output.robot_commands.end());
@@ -236,6 +275,11 @@ class CustomController : public rclcpp::Node {
   }
 
   // ── ROS2 handles ────────────────────────────────────────────────────────────
+  rclcpp::CallbackGroup::SharedPtr cb_group_rt_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_sensor_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_log_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_aux_;
+
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr      joint_state_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr  target_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr  hand_state_sub_;
@@ -278,7 +322,57 @@ class CustomController : public rclcpp::Node {
 // ── Entry point ────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<CustomController>());
+
+  // 1. Lock all current and future pages in memory (prevent page faults)
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    fprintf(stderr, "[WARN] mlockall failed — page faults possible\n");
+  }
+
+  auto node = std::make_shared<CustomController>();
+
+  // 2. Create executors for each callback group
+  rclcpp::executors::SingleThreadedExecutor rt_executor;
+  rclcpp::executors::SingleThreadedExecutor sensor_executor;
+  rclcpp::executors::SingleThreadedExecutor log_executor;
+  rclcpp::executors::SingleThreadedExecutor aux_executor;
+
+  // 3. Add callback groups to respective executors
+  rt_executor.add_callback_group(
+      node->GetRtGroup(), node->get_node_base_interface());
+  sensor_executor.add_callback_group(
+      node->GetSensorGroup(), node->get_node_base_interface());
+  log_executor.add_callback_group(
+      node->GetLogGroup(), node->get_node_base_interface());
+  aux_executor.add_callback_group(
+      node->GetAuxGroup(), node->get_node_base_interface());
+
+  // 4. Helper lambda to create thread with RT config
+  auto make_thread = [](auto& executor, const urtc::ThreadConfig& cfg) {
+    return std::thread([&executor, cfg]() {
+      if (!urtc::ApplyThreadConfig(cfg)) {
+        fprintf(stderr, "[WARN] Thread config failed for '%s' (need realtime permissions)\n",
+                cfg.name.c_str());
+      } else {
+        fprintf(stdout, "[INFO] Thread '%s' configured:\n%s",
+                cfg.name.c_str(),
+                urtc::VerifyThreadConfig().c_str());
+      }
+      executor.spin();
+    });
+  };
+
+  // 5. Launch threads with respective configurations
+  auto t_rt     = make_thread(rt_executor,     urtc::kRtControlConfig);
+  auto t_sensor = make_thread(sensor_executor, urtc::kSensorConfig);
+  auto t_log    = make_thread(log_executor,    urtc::kLoggingConfig);
+  auto t_aux    = make_thread(aux_executor,    urtc::kAuxConfig);
+
+  // 6. Wait for threads to finish
+  t_rt.join();
+  t_sensor.join();
+  t_log.join();
+  t_aux.join();
+
   rclcpp::shutdown();
   return 0;
 }
