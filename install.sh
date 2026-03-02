@@ -10,8 +10,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-echo -e "${BLUE}🚀 UR5e RT Controller v4.0.0 Installation${NC}"
-echo "=================================================="
+echo -e "${BLUE}🚀 UR5e RT Controller v4.2.1 Installation${NC}"
+echo "==================================================="
 
 # Check ROS2
 if ! command -v ros2 &> /dev/null; then
@@ -54,25 +54,26 @@ sudo apt install -y \
     python3-colcon-common-extensions \
     python3-vcstool
 
-# Python visualization
-pip3 install --user -U matplotlib pandas numpy scipy
+# Python dependencies from requirements.txt
+echo -e "${BLUE}🐍 Installing Python dependencies...${NC}"
+if [[ -f "ur5e-rt-controller/requirements.txt" ]]; then
+    pip3 install --user -r ur5e-rt-controller/requirements.txt
+else
+    echo -e "${YELLOW}⚠️  requirements.txt not found, installing defaults${NC}"
+    pip3 install --user matplotlib pandas numpy scipy
+fi
 
 echo -e "${GREEN}✅ System dependencies installed${NC}"
 
 # Clone package (if not exists)
-if [[ ! -d "ur5e_rt_controller" ]]; then
-    echo -e "${BLUE}📥 Cloning ur5e_rt_controller...${NC}"
-    git clone https://github.com/your-repo/ur5e_rt_controller.git
-    cd ur5e_rt_controller
-    ./organize_files.sh
+if [[ ! -d "ur5e-rt-controller" ]]; then
+    echo -e "${BLUE}📥 Cloning ur5e-rt-controller...${NC}"
+    git clone https://github.com/hyujun/ur5e-rt-controller.git
+    cd ur5e-rt-controller
 else
-    echo -e "${YELLOW}📁 ur5e_rt_controller already exists${NC}"
-    cd ur5e_rt_controller
+    echo -e "${YELLOW}📁 ur5e-rt-controller already exists${NC}"
+    cd ur5e-rt-controller
 fi
-
-# Make executables
-echo -e "${BLUE}🔧 Setting executable permissions...${NC}"
-chmod +x scripts/*.py launch/*.launch.py install.sh organize_files.sh
 
 # Build
 echo -e "${BLUE}🔨 Building package...${NC}"
@@ -84,7 +85,31 @@ source install/setup.bash
 echo "export ROS_WORKSPACE=$WORKSPACE" >> ~/.bashrc
 echo "source $WORKSPACE/install/setup.bash" >> ~/.bashrc
 
+# RT permissions for v4.2.0+ parallel computing
+echo ""
+echo -e "${BLUE}⚙️  Setting up RT permissions for v4.2.0+ parallel computing...${NC}"
+if ! groups | grep -q realtime; then
+    echo -e "${YELLOW}Creating realtime group and setting limits...${NC}"
+    sudo groupadd -f realtime
+    sudo usermod -aG realtime $USER
+    
+    # Check if already configured
+    if ! grep -q "@realtime.*rtprio" /etc/security/limits.conf; then
+        echo "@realtime - rtprio 99" | sudo tee -a /etc/security/limits.conf
+    fi
+    if ! grep -q "@realtime.*memlock" /etc/security/limits.conf; then
+        echo "@realtime - memlock unlimited" | sudo tee -a /etc/security/limits.conf
+    fi
+    
+    echo -e "${GREEN}✅ RT permissions configured${NC}"
+    echo -e "${YELLOW}⚠️  IMPORTANT: Please LOGOUT and LOGIN again for RT permissions to take effect${NC}"
+    echo -e "${YELLOW}   Then verify with: ulimit -r (should show 99)${NC}"
+else
+    echo -e "${GREEN}✅ RT permissions already configured${NC}"
+fi
+
 # Verify installation
+echo ""
 echo -e "${BLUE}✅ Verifying installation...${NC}"
 if ros2 pkg list | grep -q ur5e_rt_controller; then
     echo -e "${GREEN}✅ Package successfully installed!${NC}"
@@ -103,7 +128,7 @@ echo -e "${GREEN}✅ Log directories created${NC}"
 
 echo ""
 echo -e "${GREEN}🎉 Installation COMPLETE!${NC}"
-echo "=================================================="
+echo "==================================================="
 echo ""
 echo "🚀 Quick Start Commands:"
 echo ""
@@ -114,8 +139,25 @@ echo "2. Hand UDP only:"
 echo "   ros2 launch ur5e_rt_controller hand_udp.launch.py"
 echo ""
 echo "3. Health monitor:"
-echo "   ros2 run ur5e_rt_controller monitor_data_health_v2.py"
+echo "   ros2 run ur5e_rt_controller monitor_data_health.py"
+echo ""
+echo "4. Plot trajectory:"
+echo "   ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv"
+echo ""
+echo "5. Motion editor GUI:"
+echo "   ros2 run ur5e_rt_controller motion_editor_gui.py"
+echo ""
+echo "6. Hand simulator:"
+echo "   ros2 run ur5e_rt_controller hand_udp_sender_example.py"
 echo ""
 echo "📊 Logs saved to: /tmp/ur5e_control_log.csv"
 echo ""
-echo "🔧 Troubleshooting: docs/troubleshooting.md"
+echo "📚 Additional resources:"
+echo "   - RT optimization guide: RT_OPTIMIZATION.md"
+echo "   - Full documentation: README.md"
+echo "   - Changelog: CHANGELOG.md"
+echo ""
+echo "⚠️  For v4.2.0+ parallel computing:"
+echo "   1. Logout and login after installation"
+echo "   2. Verify RT permissions: ulimit -r (should be 99)"
+echo "   3. See RT_OPTIMIZATION.md for CPU isolation setup"
