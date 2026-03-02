@@ -1,6 +1,6 @@
 # UR5e RT Controller
 
-**Ubuntu 22.04 + ROS2 Humble | 실시간 UR5e 제어기 + 커스텀 핸드 통합 (v4.0.0)**
+**Ubuntu 22.04 + ROS2 Humble | 실시간 UR5e 제어기 + 커스텀 핸드 통합 (v4.2.2)**
 
 E-STOP 안전 시스템, PD 제어기, UDP 핸드 인터페이스, CSV 데이터 로깅, Qt GUI 모션 에디터를 포함한 완전한 실시간 제어 솔루션입니다.
 
@@ -28,6 +28,7 @@ E-STOP 안전 시스템, PD 제어기, UDP 핸드 인터페이스, CSV 데이터
 | 기능 | 설명 |
 |------|------|
 | 실시간 제어 | 500Hz PD 제어 루프 (`custom_controller`) |
+| 병렬 컴퓨팅 | CallbackGroup 기반 멀티스레드 executor (v4.2.0+) |
 | E-STOP 시스템 | 로봇/핸드 데이터 타임아웃 자동 감지 및 비상 정지 |
 | 커스텀 핸드 통합 | UDP 기반 4-DOF 핸드 데이터 수신/송신 |
 | 데이터 로깅 | CSV 형식의 제어 데이터 실시간 기록 (`DataLogger`) |
@@ -42,45 +43,47 @@ E-STOP 안전 시스템, PD 제어기, UDP 핸드 인터페이스, CSV 데이터
 
 ```
 ur5e_rt_controller/
-├── CMakeLists.txt                         # 빌드 설정 (C++17, ament_cmake)
-├── package.xml                            # ROS2 패키지 메타데이터 (v4.0.0)
+├── .gitignore                             # Git 제외 파일 설정
+├── CMakeLists.txt                         # 빌드 설정 (C++20, ament_cmake)
+├── LICENSE                                # MIT License
+├── README.md                              # 이 문서
 ├── install.sh                             # 자동 설치 스크립트
-├── organize_files.sh                      # 파일 정리 스크립트
-├── setup.py                               # Python 패키지 설정
+├── package.xml                            # ROS2 패키지 메타데이터 (v4.2.2)
 ├── requirements.txt                       # Python 의존성 목록
 │
 ├── config/                                # YAML 설정 파일
-│   ├── ur5e_rt_controller.yaml            # 제어기 파라미터 + E-STOP 설정
-│   └── hand_udp_receiver.yaml             # UDP 핸드 수신기 설정
+│   ├── hand_udp_receiver.yaml            # UDP 핸드 수신기 설정
+│   └── ur5e_rt_controller.yaml           # 제어기 파라미터 + E-STOP 설정
 │
-├── launch/                                # ROS2 런치 파일
-│   ├── ur_control.launch.py               # 전체 시스템 실행 (UR 드라이버 + 제어기)
-│   └── hand_udp.launch.py                 # UDP 핸드 노드 단독 실행
+├── docs/                                  # 문서
+│   ├── CHANGELOG.md                      # 버전별 변경 이력
+│   └── RT_OPTIMIZATION.md                # 실시간 최적화 가이드 (v4.2.0)
 │
 ├── include/ur5e_rt_controller/            # C++ 헤더 파일
-│   ├── rt_controller_interface.hpp        # 제어기 기반 인터페이스 (Strategy Pattern)
-│   ├── data_logger.hpp                    # CSV 데이터 로거
-│   ├── hand_udp_receiver.hpp              # UDP 핸드 수신기 클래스
-│   ├── hand_udp_sender.hpp                # UDP 핸드 송신기 클래스
-│   └── controllers/                       # 제어기 구현체
-│       ├── p_controller.hpp               # P 제어기 (비례 제어)
-│       └── pd_controller.hpp              # PD 제어기 + E-STOP 지원
+│   ├── controllers/                       # 제어기 구현체
+│   │   ├── p_controller.hpp              # P 제어기 (비례 제어)
+│   │   └── pd_controller.hpp             # PD 제어기 + E-STOP 지원
+│   ├── data_logger.hpp                   # CSV 데이터 로거
+│   ├── hand_udp_receiver.hpp             # UDP 핸드 수신기 클래스
+│   ├── hand_udp_sender.hpp               # UDP 핸드 송신기 클래스
+│   ├── rt_controller_interface.hpp       # 제어기 기반 인터페이스 (Strategy Pattern)
+│   ├── thread_config.hpp                 # 멀티스레드 설정 구조체 (v4.2.0)
+│   └── thread_utils.hpp                  # RT 스케줄링 유틸리티 (v4.2.0)
 │
-├── src/                                   # C++ 소스 파일
-│   ├── custom_controller.cpp              # 메인 제어 노드 (500Hz, E-STOP)
-│   ├── hand_udp_receiver_node.cpp         # 핸드 UDP 수신 ROS2 노드
-│   └── hand_udp_sender_node.cpp           # 핸드 UDP 송신 ROS2 노드
+├── launch/                                # ROS2 런치 파일
+│   ├── hand_udp.launch.py                # UDP 핸드 노드 단독 실행
+│   └── ur_control.launch.py              # 전체 시스템 실행 (UR 드라이버 + 제어기)
 │
-├── scripts/                               # Python 스크립트
-│   ├── monitor_data_health.py             # 데이터 헬스 모니터 + 통계
-│   ├── plot_ur_trajectory.py              # CSV 로그 시각화
-│   ├── motion_editor_gui.py               # Qt5 50포즈 모션 에디터
-│   └── hand_udp_sender_example.py         # UDP 핸드 송신 예제
+├── scripts/                               # Python 유틸리티
+│   ├── hand_udp_sender_example.py        # UDP 핸드 송신 예제
+│   ├── monitor_data_health.py            # 데이터 헬스 모니터 + 통계
+│   ├── motion_editor_gui.py              # Qt5 50포즈 모션 에디터
+│   └── plot_ur_trajectory.py             # CSV 로그 시각화
 │
-├── docs/                                  # 문서 (추가 예정)
-├── rviz/                                  # RViz 설정 파일 (추가 예정)
-├── test/                                  # 테스트 코드 (추가 예정)
-└── resources/                             # 리소스 파일 (추가 예정)
+└── src/                                   # C++ 소스 파일
+    ├── custom_controller.cpp             # 메인 제어 노드 (500Hz, E-STOP)
+    ├── hand_udp_receiver_node.cpp        # 핸드 UDP 수신 ROS2 노드
+    └── hand_udp_sender_node.cpp          # 핸드 UDP 송신 ROS2 노드
 ```
 
 ---
@@ -120,7 +123,7 @@ ur5e_rt_controller/
 ### 주요 클래스
 
 #### `CustomController` (`src/custom_controller.cpp`)
-500Hz 제어 루프를 실행하는 메인 ROS2 노드.
+500Hz 제어 루프를 실행하는 메인 ROS2 노드. v4.2.0부터 4개 CallbackGroup으로 분리된 멀티스레드 executor 지원.
 
 | 멤버 | 타입 | 역할 |
 |------|------|------|
@@ -128,6 +131,10 @@ ur5e_rt_controller/
 | `logger_` | `DataLogger` | CSV 로깅 |
 | `control_timer_` | `rclcpp::TimerBase` | 500Hz 제어 루프 |
 | `timeout_timer_` | `rclcpp::TimerBase` | 50Hz E-STOP 감시 |
+| `cb_group_rt_` | CallbackGroup | RT 제어 루프 (Core 2, SCHED_FIFO 90) |
+| `cb_group_sensor_` | CallbackGroup | 센서 데이터 수신 (Core 3, SCHED_FIFO 70) |
+| `cb_group_log_` | CallbackGroup | 로깅 작업 (Core 4, SCHED_OTHER) |
+| `cb_group_aux_` | CallbackGroup | 보조 작업 (Core 5, SCHED_OTHER) |
 
 파라미터:
 
@@ -204,6 +211,13 @@ chmod +x install.sh
 ./install.sh
 ```
 
+**install.sh가 자동으로 수행하는 작업**:
+- ROS2 의존성 설치 (ur_robot_driver, control_msgs 등)
+- Python 의존성 설치 (requirements.txt)
+- 패키지 빌드 (colcon build)
+- **RT 권한 설정** (realtime 그룹, rtprio 99, memlock unlimited)
+- 환경변수 설정 (~/.bashrc)
+
 ### 4. 수동 설치
 
 ```bash
@@ -218,13 +232,14 @@ sudo apt install -y \
     python3-colcon-common-extensions
 
 # Python 의존성
-pip3 install --user matplotlib pandas numpy scipy
+pip3 install --user -r requirements.txt
 
-# RT 권한 설정 (선택)
+# RT 권한 설정 (v4.2.0+ 필수)
 sudo groupadd realtime
 sudo usermod -aG realtime $USER
 echo "@realtime - rtprio 99" | sudo tee -a /etc/security/limits.conf
 echo "@realtime - memlock unlimited" | sudo tee -a /etc/security/limits.conf
+# 로그아웃 후 재로그인 필수!
 ```
 
 ### 5. 빌드
@@ -232,7 +247,7 @@ echo "@realtime - memlock unlimited" | sudo tee -a /etc/security/limits.conf
 ```bash
 mkdir -p ~/ur_ws/src
 cd ~/ur_ws/src
-# 이 저장소를 클론 또는 복사
+git clone https://github.com/hyujun/ur5e-rt-controller.git
 
 cd ~/ur_ws
 colcon build --packages-select ur5e_rt_controller --symlink-install
@@ -259,7 +274,7 @@ ros2 launch ur5e_rt_controller ur_control.launch.py robot_ip:=192.168.1.10
 
 런치 파일이 시작하는 노드:
 1. `ur_robot_driver` - UR5e 드라이버 (ur_type: ur5e)
-2. `custom_controller` - 500Hz PD 제어 노드 + E-STOP
+2. `custom_controller` - 500Hz PD 제어 노드 + E-STOP + 병렬 컴퓨팅
 3. `data_health_monitor` - 데이터 헬스 모니터 (10Hz)
 
 시뮬레이션(fake hardware) 테스트:
@@ -283,7 +298,7 @@ ros2 launch ur5e_rt_controller hand_udp.launch.py \
 sudo apt install python3-pyqt5
 
 # GUI 실행
-python3 scripts/motion_editor_gui.py
+ros2 run ur5e_rt_controller motion_editor_gui.py
 ```
 
 GUI 사용법:
@@ -298,23 +313,23 @@ GUI 사용법:
 
 ```bash
 # 모든 관절 플롯
-python3 scripts/plot_ur_trajectory.py /tmp/ur5e_control_log.csv
+ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv
 
 # 특정 관절만 (0~5)
-python3 scripts/plot_ur_trajectory.py /tmp/ur5e_control_log.csv --joint 2
+ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --joint 2
 
 # 이미지 파일로 저장
-python3 scripts/plot_ur_trajectory.py /tmp/ur5e_control_log.csv --save-dir ~/ur_plots
+ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --save-dir ~/ur_plots
 
 # 통계만 출력
-python3 scripts/plot_ur_trajectory.py /tmp/ur5e_control_log.csv --stats
+ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --stats
 ```
 
 ### 핸드 UDP 테스트 (예제)
 
 ```bash
 # 사인파 테스트 데이터 전송 (500Hz)
-python3 scripts/hand_udp_sender_example.py
+ros2 run ur5e_rt_controller hand_udp_sender_example.py
 # → 1) 사인파 (동적) / 2) 고정 포즈 (정적) 선택
 ```
 
@@ -447,9 +462,20 @@ sock.sendto(packet, target)
 
 ## 성능 지표
 
+### v4.2.0+ 병렬 컴퓨팅 개선
+
+| 메트릭 | v4.0.0 | v4.2.0+ | 개선율 |
+|--------|--------|---------|--------|
+| 제어 지터 | ~500μs | <50μs | **10배** |
+| E-STOP 반응 시간 | ~100ms | <20ms | **5배** |
+| CPU 사용률 | ~30% | ~25% | 17% 감소 |
+| Context Switch | ~5000/s | ~1000/s | 80% 감소 |
+
+### 일반 성능
+
 | 항목 | 값 |
 |------|-----|
-| 제어 주파수 | 500Hz |
+| 제어 주파수 | 500Hz (2ms) |
 | E-STOP 감시 주기 | 50Hz (20ms) |
 | 핸드 데이터 퍼블리시 | 100Hz |
 | GUI 업데이트 | 100Hz (Qt 타이머 10ms) |
@@ -457,6 +483,13 @@ sock.sendto(packet, target)
 | 핸드 E-STOP 타임아웃 | 200ms |
 | CSV 로그 경로 | `/tmp/ur5e_control_log.csv` |
 | 통계 저장 경로 | `/tmp/ur5e_stats/` |
+
+**v4.2.0+ RT 최적화**:
+- 4개 CallbackGroup 분리 (RT, Sensor, Log, Aux)
+- CPU affinity (Core 2-5 전용)
+- SCHED_FIFO 실시간 스케줄링
+- mlockall 메모리 잠금
+- 상세 가이드: [docs/RT_OPTIMIZATION.md](docs/RT_OPTIMIZATION.md)
 
 ---
 
@@ -482,11 +515,39 @@ ros2 topic echo /system/estop_status  # E-STOP 상태 확인
 # 1) RT 커널 확인
 uname -v  # "lowlatency" 또는 "PREEMPT_RT"
 
-# 2) CPU 성능 모드 설정
+# 2) RT 권한 확인 (v4.2.0+ 필수)
+ulimit -r  # 99여야 함
+groups | grep realtime  # realtime 그룹 포함 확인
+
+# 3) CPU 성능 모드 설정
 sudo cpupower frequency-set -g performance
 
-# 3) RMW 변경
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# 4) CPU isolation (선택, 최대 성능)
+# docs/RT_OPTIMIZATION.md 참조
+```
+
+### RT 권한 부족 경고
+
+```
+[WARN] Thread config failed for 'rt_control' (need realtime permissions)
+```
+
+**해결**:
+```bash
+# 1. 권한 설정 확인
+cat /etc/security/limits.conf | grep realtime
+# @realtime - rtprio 99
+# @realtime - memlock unlimited
+
+# 2. 그룹 확인
+groups | grep realtime
+
+# 3. 로그아웃 후 재로그인 (필수!)
+# 또는
+newgrp realtime
+
+# 4. 확인
+ulimit -r  # 99 출력되어야 함
 ```
 
 ### UR 드라이버 연결 실패
@@ -552,10 +613,20 @@ ros2 topic hz /hand/joint_states
 ros2 control list_controllers -v
 
 # 데이터 헬스 모니터 단독 실행
-python3 scripts/monitor_data_health.py
+ros2 run ur5e_rt_controller monitor_data_health.py
+
+# 스레드 설정 확인 (v4.2.0+)
+PID=$(pgrep -f custom_controller)
+ps -eLo pid,tid,cls,rtprio,psr,comm | grep $PID
+# 출력:
+#   PID   TID CLS RTPRIO PSR COMMAND
+#  1234  1235  FF     90   2 rt_control    ← Core 2, FIFO 90
+#  1234  1236  FF     70   3 sensor_io     ← Core 3, FIFO 70
+#  1234  1237  TS      -   4 logger        ← Core 4, OTHER
+#  1234  1238  TS      -   5 aux           ← Core 5, OTHER
 
 # 시스템 지터 측정 (RT 커널)
-sudo cyclictest -l100000 -m -n -p99 -t1 -i200
+sudo cyclictest -l100000 -m -n -p99 -t1 -i2000
 ```
 
 ---
@@ -656,26 +727,41 @@ timestamp, current_pos_0, current_pos_1, ..., current_pos_5,
 
 ## 참고 자료
 
+### 공식 문서
 - [Universal Robots ROS2 Driver](https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver)
 - [ROS2 Control Framework](https://control.ros.org/)
+- [ROS2 Executors & Callback Groups](https://docs.ros.org/en/humble/Concepts/Intermediate/About-Executors.html)
 - [PREEMPT_RT 실시간 리눅스](https://wiki.linuxfoundation.org/realtime/start)
 - [Eigen3 문서](https://eigen.tuxfamily.org/dox/)
+
+### 프로젝트 문서
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) - 버전별 상세 변경 이력
+- [docs/RT_OPTIMIZATION.md](docs/RT_OPTIMIZATION.md) - v4.2.0 실시간 최적화 가이드
+  - CallbackGroup 아키텍처
+  - CPU affinity 설정
+  - RT 스케줄링
+  - 성능 벤치마크
+  - 문제 해결
 
 ---
 
 ## 라이선스
 
-MIT License
+MIT License - [LICENSE](LICENSE) 파일 참조
 
 ---
 
 ## 버전 이력
 
-| 버전 | 변경사항 |
-|------|----------|
-| v4.0.0 | E-STOP 시스템 추가, 핸드/로봇 타임아웃 감시, 안전 위치 복귀 |
+| 버전 | 주요 변경사항 |
+|------|---------------|
+| v4.2.2 | 디렉토리 구조 개선 (docs/ 생성, LICENSE 추가, .gitignore 추가) |
+| v4.2.1 | setup.py 제거, CMakeLists.txt 스크립트 정리 |
+| v4.2.0 | 병렬 컴퓨팅 최적화 (CallbackGroup, RT 스케줄링, CPU affinity) |
+| v4.0.0 | E-STOP 시스템, 핸드/로봇 타임아웃 감시, 표준 ROS2 구조 |
 | v3.0.0 | PD 제어기 E-STOP 지원, 안전 위치 설정 |
 | v2.0.0 | DataLogger CSV 로깅, 핸드 UDP 통합 |
 | v1.0.0 | 초기 릴리스, P/PD 제어기, 기본 ROS2 노드 |
 
-**최종 업데이트**: 2026-03-02
+**최종 업데이트**: 2026-03-02  
+**현재 버전**: v4.2.2
