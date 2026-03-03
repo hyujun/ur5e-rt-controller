@@ -101,6 +101,68 @@
 
 > **권장**: 제어 알고리즘 검증은 `free_run`, 실배포 가능성 평가는 `sync_step` 모드 사용
 
+### 2.4 Real-Time Factor (RTF) 측정
+
+RTF는 시뮬레이션 시간과 실제 벽시계 시간의 비율:
+
+```
+RTF = Δsim_time / Δwall_time
+```
+
+- `free_run` 모드: RTF >> 1.0 (하드웨어와 제어기 연산량에 따라 수십~수백 배)
+- `sync_step` 모드: RTF ≈ `timestep / Compute_time` (대부분 < 1.0)
+
+#### 측정 설계
+
+| 구성 요소 | 세부 내용 |
+|-----------|---------|
+| 갱신 주기 | 매 200 스텝마다 (최소 10 ms 벽시계 경과 시에만 갱신) |
+| 측정 방식 | 롤링 윈도우 — 직전 갱신 이후의 Δwall / Δsim |
+| 저장 | `std::atomic<double> rtf_` (sim 스레드 write, viewer 스레드 read) |
+| 표시 | MuJoCo GLFW 뷰어 우상단 `mjr_overlay()` |
+
+#### 뷰어 오버레이 표시 형식 (우상단)
+
+```
+Real-Time Factor  │  50.3x
+Sim Time          │  12.45 s
+Steps             │  6225
+Mode              │  free_run
+```
+
+#### 새로운 클래스 멤버 (`mujoco_simulator.hpp`)
+
+```cpp
+// RTF 측정용 — sim 스레드에서만 접근 (mutex 불필요)
+std::chrono::steady_clock::time_point rtf_wall_start_{};
+double                                rtf_sim_start_{0.0};
+
+// viewer 스레드가 읽는 atomic (relaxed 충분)
+std::atomic<double>                   rtf_{0.0};
+
+// 공개 접근자
+[[nodiscard]] double GetRtf() const noexcept { return rtf_.load(); }
+
+// UpdateRtf() — 200 스텝마다 RTF를 갱신 (sim 스레드 전용)
+void UpdateRtf(uint64_t step) noexcept;
+```
+
+`UpdateRtf()` 구현:
+
+```cpp
+inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
+  if (step % 200 != 0) { return; }
+  const auto   wall_now = std::chrono::steady_clock::now();
+  const double wall_dt  = std::chrono::duration<double>(wall_now - rtf_wall_start_).count();
+  const double sim_dt   = data_->time - rtf_sim_start_;
+  if (wall_dt > 0.01) {   // 10 ms 이상 경과한 경우에만 갱신
+    rtf_.store(sim_dt / wall_dt, std::memory_order_relaxed);
+    rtf_wall_start_ = wall_now;
+    rtf_sim_start_  = data_->time;
+  }
+}
+```
+
 ---
 
 ## 3. 구현 파일 목록
@@ -851,21 +913,36 @@ ros2 launch ur5e_rt_controller mujoco_sim.launch.py \
 | `ClikController` | < 1500 μs | < 1% |
 | `OperationalSpaceController` | < 2000 μs | < 1% |
 
-### 5.3 시뮬레이션 속도 측정
+### 5.3 Real-Time Factor (RTF) 측정
 
-`free_run` 모드에서 시뮬레이션 배속 측정:
+`free_run` 모드에서 시뮬레이션 배속을 RTF로 확인:
 
 ```bash
-# 터미널 1: 시뮬레이션 실행
+# 뷰어 활성화 상태로 실행 — GLFW 창 우상단에 RTF가 실시간 표시됨
+ros2 launch ur5e_rt_controller mujoco_sim.launch.py sim_mode:=free_run
+
+# Headless 환경: /sim/status 토픽으로 sim_time 추이를 로그에서 확인
 ros2 launch ur5e_rt_controller mujoco_sim.launch.py sim_mode:=free_run enable_viewer:=false
-
-# 터미널 2: 시뮬 시간 속도 측정 (sim_time / wall_time)
-ros2 topic echo /sim/timing_stats
-
-# 기대값 예시:
-# PDController:  sim_speed ≈ 50~200× (하드웨어 의존)
-# OSCController: sim_speed ≈ 5~20× (연산 비용 높음)
+ros2 topic echo /sim/status   # 1 Hz 로 running, steps, sim_time 출력
 ```
+
+**뷰어 오버레이 예시:**
+
+```
+Real-Time Factor  │  87.4x      ← PDController (경량)
+Sim Time          │  43.70 s
+Steps             │  21850
+Mode              │  free_run
+```
+
+**기대 RTF 범위 (하드웨어 의존):**
+
+| 제어기 | 기대 RTF (`free_run`) |
+|--------|----------------------|
+| `PDController` | 50 ~ 200× |
+| `PinocchioController` | 10 ~ 50× |
+| `ClikController` | 5 ~ 20× |
+| `OperationalSpaceController` | 2 ~ 10× |
 
 ### 5.4 실행 명령 예시
 

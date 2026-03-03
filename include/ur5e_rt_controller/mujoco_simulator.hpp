@@ -10,7 +10,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -101,6 +103,9 @@ class MuJoCoSimulator {
   [[nodiscard]] uint64_t StepCount()  const noexcept { return step_count_.load(); }
   [[nodiscard]] double   SimTimeSec() const noexcept { return sim_time_sec_.load(); }
   [[nodiscard]] int      NumJoints()  const noexcept { return model_ ? model_->nq : 0; }
+  // Real-Time Factor: sim_time / wall_time (updated every 200 steps).
+  // Returns 0.0 before the first measurement window completes.
+  [[nodiscard]] double   GetRtf()     const noexcept { return rtf_.load(std::memory_order_relaxed); }
 
  private:
   Config   cfg_;
@@ -143,6 +148,14 @@ class MuJoCoSimulator {
   std::array<int, 6> joint_qpos_indices_{0, 1, 2, 3, 4, 5};
   std::array<int, 6> joint_qvel_indices_{0, 1, 2, 3, 4, 5};
 
+  // Real-Time Factor (RTF = Δsim_time / Δwall_time).
+  // rtf_wall_start_ and rtf_sim_start_ are only accessed from the sim thread
+  // (no mutex needed).  rtf_ is written by the sim thread and read by the
+  // viewer thread using relaxed ordering (stale reads are acceptable).
+  std::chrono::steady_clock::time_point rtf_wall_start_{};
+  double                                rtf_sim_start_{0.0};
+  std::atomic<double>                   rtf_{0.0};
+
   // ── Internal helpers ───────────────────────────────────────────────────────
   // Resolve joint names → qpos/qvel indices using mj_name2id().
   // Falls back to static 0–5 mapping if a joint is not found.
@@ -160,6 +173,9 @@ class MuJoCoSimulator {
 
   // Update viz_qpos_ using try_lock (never blocks SimLoop).
   void UpdateVizBuffer() noexcept;
+
+  // Update rtf_ every 200 steps (sim thread only).
+  void UpdateRtf(uint64_t step) noexcept;
 
   void SimLoopFreeRun(std::stop_token stop) noexcept;
   void SimLoopSyncStep(std::stop_token stop) noexcept;
@@ -346,6 +362,27 @@ inline void MuJoCoSimulator::UpdateVizBuffer() noexcept {
   }
 }
 
+// ── UpdateRtf ──────────────────────────────────────────────────────────────────
+//
+// Called after every physics step from the sim thread.
+// Refreshes rtf_ every 200 steps (rolling window) when at least 10 ms of
+// wall-clock time has elapsed — avoids division by near-zero at startup.
+//
+inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
+  if (step % 200 != 0) { return; }
+
+  const auto   wall_now = std::chrono::steady_clock::now();
+  const double wall_dt  =
+      std::chrono::duration<double>(wall_now - rtf_wall_start_).count();
+  const double sim_dt   = data_->time - rtf_sim_start_;
+
+  if (wall_dt > 0.01) {  // require ≥10 ms to avoid near-zero division
+    rtf_.store(sim_dt / wall_dt, std::memory_order_relaxed);
+    rtf_wall_start_ = wall_now;
+    rtf_sim_start_  = data_->time;
+  }
+}
+
 // ── SimLoopFreeRun ─────────────────────────────────────────────────────────────
 //
 // Advances physics as fast as possible (no nanosleep / wall-clock sync).
@@ -359,6 +396,10 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
       cfg_.publish_decimation > 0 ? cfg_.publish_decimation : 1);
 
   uint64_t step = 0;
+
+  // Initialise RTF tracking window.
+  rtf_wall_start_ = std::chrono::steady_clock::now();
+  rtf_sim_start_  = data_->time;
 
   while (!stop.stop_requested() && running_.load()) {
     // Lock-free fast path: acquire mutex only when a command arrived.
@@ -377,6 +418,9 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
       ReadState();
       InvokeStateCallback();
     }
+
+    // Update RTF every 200 steps.
+    UpdateRtf(step);
 
     // Update viewer buffer at ~1/8 rate (avoid starving viewer with mutex contention).
     if ((step % 8 == 0) && cfg_.enable_viewer) {
@@ -406,6 +450,10 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
 
   uint64_t step = 0;
 
+  // Initialise RTF tracking window.
+  rtf_wall_start_ = std::chrono::steady_clock::now();
+  rtf_sim_start_  = data_->time;
+
   while (!stop.stop_requested() && running_.load()) {
     // 1. Publish current state to controller.
     ReadState();
@@ -431,6 +479,9 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
     ++step;
     step_count_.store(step, std::memory_order_relaxed);
     sim_time_sec_.store(data_->time, std::memory_order_relaxed);
+
+    // Update RTF every 200 steps.
+    UpdateRtf(step);
 
     if ((step % 8 == 0) && cfg_.enable_viewer) {
       UpdateVizBuffer();
@@ -516,6 +567,22 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
     mjv_updateScene(model_, vis_data, &opt, nullptr, &cam, mjCAT_ALL, &scn);
     mjr_render(viewport, &scn, &con);
+
+    // ── RTF overlay (top-right corner) ──────────────────────────────────────
+    {
+      char labels[64], values[64];
+      const double rtf_val = rtf_.load(std::memory_order_relaxed);
+      std::snprintf(labels, sizeof(labels),
+                    "Real-Time Factor\nSim Time\nSteps\nMode");
+      std::snprintf(values, sizeof(values),
+                    "%.1fx\n%.2f s\n%lu\n%s",
+                    rtf_val,
+                    sim_time_sec_.load(std::memory_order_relaxed),
+                    static_cast<unsigned long>(step_count_.load(std::memory_order_relaxed)),
+                    cfg_.mode == SimMode::kFreeRun ? "free_run" : "sync_step");
+      mjr_overlay(mjFONT_NORMAL, mjGRID_TOPRIGHT, viewport,
+                  labels, values, &con);
+    }
 
     glfwSwapBuffers(window);
     glfwPollEvents();
