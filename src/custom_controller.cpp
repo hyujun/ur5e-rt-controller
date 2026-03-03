@@ -1,4 +1,35 @@
 // ── Includes: project header first, then ROS2, then C++ stdlib ────────────────
+//
+// ── Switching to PinocchioController ────────────────────────────────────────
+// To replace PDController with the Pinocchio model-based controller:
+//
+//   Step 1 — Replace this include:
+//     #include "ur5e_rt_controller/controllers/pinocchio_controller.hpp"
+//
+//   Step 2 — Change the controller_ member type in class CustomController
+//     (around line 340) from:
+//       std::unique_ptr<urtc::PDController> controller_;
+//     to:
+//       std::unique_ptr<urtc::RTControllerInterface> controller_;
+//
+//   Step 3 — Replace the constructor initialiser (around line 42):
+//       controller_(std::make_unique<urtc::PinocchioController>(
+//           "/opt/ros/humble/share/ur_description/urdf/ur5e.urdf",
+//           urtc::PinocchioController::Gains{
+//               .kp = 5.0,
+//               .kd = 0.5,
+//               .enable_gravity_compensation  = true,
+//               .enable_coriolis_compensation = false})),
+//
+//   Step 4 — Remove the controller_->set_gains() call inside
+//     DeclareAndLoadParameters(); PinocchioController receives its gains
+//     through the constructor above.
+//
+//   After switching, Compute() automatically adds:
+//     • gravity compensation  g(q)        — Pinocchio RNEA
+//     • Coriolis forces       C(q,v)·v    — optional, off by default
+//     • TCP position and end-effector Jacobian cached as diagnostics
+// ────────────────────────────────────────────────────────────────────────────
 #include "ur5e_rt_controller/controllers/pd_controller.hpp"
 #include "ur5e_rt_controller/data_logger.hpp"
 #include "ur5e_rt_controller/log_buffer.hpp"
