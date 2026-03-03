@@ -61,6 +61,10 @@ class MuJoCoSimulator {
     int         publish_decimation{1};
     // kSyncStep: max time to wait for a command before using the previous one.
     double      sync_timeout_ms{50.0};
+    // Maximum Real-Time Factor (0.0 = unlimited).
+    // Both sim loops sleep after each mj_step() to keep RTF ≤ max_rtf.
+    // Example: 10.0 → sim runs at most 10× real time.
+    double      max_rtf{0.0};
     // Initial joint positions (radians) — UR5e safe upright pose.
     std::array<double, 6> initial_qpos{
         0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0};
@@ -156,6 +160,11 @@ class MuJoCoSimulator {
   double                                rtf_sim_start_{0.0};
   std::atomic<double>                   rtf_{0.0};
 
+  // Max-RTF throttle reference (sim thread only, set at loop start).
+  // ThrottleIfNeeded() sleeps to keep RTF ≤ cfg_.max_rtf.
+  std::chrono::steady_clock::time_point throttle_wall_start_{};
+  double                                throttle_sim_start_{0.0};
+
   // ── Internal helpers ───────────────────────────────────────────────────────
   // Resolve joint names → qpos/qvel indices using mj_name2id().
   // Falls back to static 0–5 mapping if a joint is not found.
@@ -176,6 +185,9 @@ class MuJoCoSimulator {
 
   // Update rtf_ every 200 steps (sim thread only).
   void UpdateRtf(uint64_t step) noexcept;
+
+  // Sleep after each mj_step() to enforce cfg_.max_rtf (no-op when max_rtf==0).
+  void ThrottleIfNeeded() noexcept;
 
   void SimLoopFreeRun(std::stop_token stop) noexcept;
   void SimLoopSyncStep(std::stop_token stop) noexcept;
@@ -383,6 +395,31 @@ inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
   }
 }
 
+// ── ThrottleIfNeeded ───────────────────────────────────────────────────────────
+//
+// Enforces cfg_.max_rtf by sleeping after each physics step.
+// The reference point (throttle_wall_start_, throttle_sim_start_) is set once
+// at the start of each SimLoop and never reset, so the constraint applies to
+// the cumulative sim_time / wall_time ratio from loop start.
+//
+// If wall time falls behind (e.g., due to OS jitter), the loop simply runs at
+// full speed until the ratio is restored — no "catch-up" in reverse.
+// No-op when cfg_.max_rtf == 0.0.
+//
+inline void MuJoCoSimulator::ThrottleIfNeeded() noexcept {
+  if (cfg_.max_rtf <= 0.0) { return; }
+
+  const double sim_elapsed  = data_->time - throttle_sim_start_;
+  const double target_wall  = sim_elapsed / cfg_.max_rtf;
+  const double actual_wall  = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - throttle_wall_start_).count();
+
+  if (actual_wall < target_wall) {
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(target_wall - actual_wall));
+  }
+}
+
 // ── SimLoopFreeRun ─────────────────────────────────────────────────────────────
 //
 // Advances physics as fast as possible (no nanosleep / wall-clock sync).
@@ -397,9 +434,12 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
 
   uint64_t step = 0;
 
-  // Initialise RTF tracking window.
-  rtf_wall_start_ = std::chrono::steady_clock::now();
-  rtf_sim_start_  = data_->time;
+  // Initialise RTF tracking and max-RTF throttle windows.
+  const auto loop_start = std::chrono::steady_clock::now();
+  rtf_wall_start_      = loop_start;
+  rtf_sim_start_       = data_->time;
+  throttle_wall_start_ = loop_start;
+  throttle_sim_start_  = data_->time;
 
   while (!stop.stop_requested() && running_.load()) {
     // Lock-free fast path: acquire mutex only when a command arrived.
@@ -421,6 +461,9 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
 
     // Update RTF every 200 steps.
     UpdateRtf(step);
+
+    // Enforce max_rtf speed cap (no-op when max_rtf == 0).
+    ThrottleIfNeeded();
 
     // Update viewer buffer at ~1/8 rate (avoid starving viewer with mutex contention).
     if ((step % 8 == 0) && cfg_.enable_viewer) {
@@ -450,9 +493,12 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
 
   uint64_t step = 0;
 
-  // Initialise RTF tracking window.
-  rtf_wall_start_ = std::chrono::steady_clock::now();
-  rtf_sim_start_  = data_->time;
+  // Initialise RTF tracking and max-RTF throttle windows.
+  const auto loop_start_ss = std::chrono::steady_clock::now();
+  rtf_wall_start_          = loop_start_ss;
+  rtf_sim_start_           = data_->time;
+  throttle_wall_start_     = loop_start_ss;
+  throttle_sim_start_      = data_->time;
 
   while (!stop.stop_requested() && running_.load()) {
     // 1. Publish current state to controller.
@@ -482,6 +528,9 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
 
     // Update RTF every 200 steps.
     UpdateRtf(step);
+
+    // Enforce max_rtf speed cap (no-op when max_rtf == 0).
+    ThrottleIfNeeded();
 
     if ((step % 8 == 0) && cfg_.enable_viewer) {
       UpdateVizBuffer();

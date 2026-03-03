@@ -33,6 +33,18 @@ mujoco_simulator:
     # If no command arrives within this window, the previous command is reused.
     sync_timeout_ms: 50.0
 
+    # ── Max Real-Time Factor ──────────────────────────────────────────────────
+    # Maximum simulation speed as a multiple of real time (0.0 = unlimited).
+    # The sim loop sleeps after each mj_step() to keep RTF ≤ this value.
+    # Applies to both free_run and sync_step modes.
+    #
+    # Examples:
+    #   0.0   → unlimited (default, max hardware speed)
+    #   1.0   → real-time (RTF = 1× — matches wall clock)
+    #   10.0  → 10× real time (10 simulated seconds per wall second)
+    #   100.0 → 100× real time
+    max_rtf: 0.0
+
     # ── Viewer ───────────────────────────────────────────────────────────────
     # Open a GLFW window for 3D visualisation.
     # Set false for headless / SSH environments.

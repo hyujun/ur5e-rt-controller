@@ -100,6 +100,16 @@ def generate_launch_description():
         description='sync_step only: command wait timeout in milliseconds',
     )
 
+    max_rtf_arg = DeclareLaunchArgument(
+        'max_rtf',
+        default_value='0.0',
+        description=(
+            'Maximum Real-Time Factor (0.0 = unlimited). '
+            'The sim loop sleeps after each mj_step() to keep RTF <= max_rtf. '
+            'Example: max_rtf:=1.0 for real-time, max_rtf:=10.0 for 10x.'
+        ),
+    )
+
     kp_arg = DeclareLaunchArgument(
         'kp',
         default_value='5.0',
@@ -135,6 +145,7 @@ def generate_launch_description():
                 'enable_viewer':      LaunchConfiguration('enable_viewer'),
                 'publish_decimation': LaunchConfiguration('publish_decimation'),
                 'sync_timeout_ms':    LaunchConfiguration('sync_timeout_ms'),
+                'max_rtf':            LaunchConfiguration('max_rtf'),
             },
         ],
     )
@@ -183,6 +194,7 @@ def generate_launch_description():
         enable_viewer_arg,
         publish_decimation_arg,
         sync_timeout_ms_arg,
+        max_rtf_arg,
         kp_arg,
         kd_arg,
         # Nodes

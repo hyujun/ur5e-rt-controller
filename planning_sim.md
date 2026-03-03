@@ -97,6 +97,7 @@
 | 시뮬레이션 속도 | 실시간의 수십~수백 배 | 제어기 연산 시간에 의해 결정 |
 | 제어기 연산 시간 측정 | 간접적 (wall clock) | **직접 측정 (step latency = Compute 시간)** |
 | E-STOP 워치독 | 비활성화 권장 | 스텝 타임아웃 기반으로 대체 |
+| `max_rtf` 효과 | 지정 배속 이하로 속도 제한 | 매우 빠른 제어기에 추가 지연 |
 | 주요 용도 | 알고리즘 검증, 궤적 생성 | 제어기 성능 분석, 실배포 전 검증 |
 
 > **권장**: 제어 알고리즘 검증은 `free_run`, 실배포 가능성 평가는 `sync_step` 모드 사용
@@ -161,6 +162,74 @@ inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
     rtf_sim_start_  = data_->time;
   }
 }
+```
+
+### 2.5 최대 배속 제한 (`max_rtf`)
+
+`max_rtf` 파라미터로 시뮬레이션의 최대 RTF를 제한한다. 두 모드 모두 지원.
+
+#### 동작 원리
+
+`mj_step()` 호출 후 `ThrottleIfNeeded()`에서 목표 벽시계 시간과 실제 벽시계 시간을 비교하여 필요한 만큼 `std::this_thread::sleep_for()`로 지연:
+
+```
+target_wall = Δsim_time / max_rtf
+actual_wall = steady_clock::now() - throttle_wall_start_
+
+if actual_wall < target_wall:
+    sleep_for(target_wall - actual_wall)
+```
+
+기준점(`throttle_wall_start_`, `throttle_sim_start_`)은 루프 시작 시 한 번만 설정하고 리셋하지 않으므로 누적 RTF 비율을 기준으로 동작한다. OS 지터 등으로 인해 wall time이 앞서 있을 경우 추가 대기 없이 통과한다.
+
+#### 파라미터 값 예시
+
+| `max_rtf` | 동작 |
+|-----------|-----|
+| `0.0` (기본) | 제한 없음 — 최대 하드웨어 속도 |
+| `1.0` | 실시간 (RT 하드웨어와 동일한 감각) |
+| `10.0` | 실시간의 최대 10배 |
+| `100.0` | 실시간의 최대 100배 |
+
+#### 새로운 설계 요소
+
+```cpp
+// Config 구조체에 추가
+double max_rtf{0.0};  // 0.0 = unlimited
+
+// 새 private 멤버 (sim 스레드 전용)
+std::chrono::steady_clock::time_point throttle_wall_start_{};
+double                                throttle_sim_start_{0.0};
+
+// 새 private 메서드
+void ThrottleIfNeeded() noexcept;
+```
+
+```cpp
+inline void MuJoCoSimulator::ThrottleIfNeeded() noexcept {
+  if (cfg_.max_rtf <= 0.0) { return; }
+  const double sim_elapsed = data_->time - throttle_sim_start_;
+  const double target_wall = sim_elapsed / cfg_.max_rtf;
+  const double actual_wall = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - throttle_wall_start_).count();
+  if (actual_wall < target_wall) {
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(target_wall - actual_wall));
+  }
+}
+```
+
+#### 사용 예시
+
+```bash
+# 실시간과 동일한 속도로 실행 (1× real time)
+ros2 launch ur5e_rt_controller mujoco_sim.launch.py max_rtf:=1.0
+
+# 최대 10배속으로 제한
+ros2 launch ur5e_rt_controller mujoco_sim.launch.py max_rtf:=10.0
+
+# 제한 없이 최대 속도 (기본값)
+ros2 launch ur5e_rt_controller mujoco_sim.launch.py max_rtf:=0.0
 ```
 
 ---
@@ -935,7 +1004,7 @@ Steps             │  21850
 Mode              │  free_run
 ```
 
-**기대 RTF 범위 (하드웨어 의존):**
+**기대 RTF 범위 (하드웨어 의존, `max_rtf: 0.0` 시):**
 
 | 제어기 | 기대 RTF (`free_run`) |
 |--------|----------------------|
@@ -943,6 +1012,14 @@ Mode              │  free_run
 | `PinocchioController` | 10 ~ 50× |
 | `ClikController` | 5 ~ 20× |
 | `OperationalSpaceController` | 2 ~ 10× |
+
+`max_rtf`로 속도를 제한하면 RTF가 지정값 이하로 유지된다:
+
+```bash
+# 실시간 동기 확인 (RTF = 1.0)
+ros2 launch ur5e_rt_controller mujoco_sim.launch.py max_rtf:=1.0
+# viewer 오버레이 기대값:  Real-Time Factor │  1.0x
+```
 
 ### 5.4 실행 명령 예시
 

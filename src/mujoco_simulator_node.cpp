@@ -65,10 +65,14 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
 
     sim_->Start();
 
+    const std::string max_rtf_str =
+        max_rtf_ > 0.0 ? std::to_string(max_rtf_) + "x" : "unlimited";
     RCLCPP_INFO(get_logger(),
-                "MuJoCo simulator ready — model: %s  mode: %s  viewer: %s",
+                "MuJoCo simulator ready — model: %s  mode: %s  viewer: %s"
+                "  max_rtf: %s",
                 model_path_.c_str(), sim_mode_.c_str(),
-                enable_viewer_ ? "ON" : "OFF");
+                enable_viewer_ ? "ON" : "OFF",
+                max_rtf_str.c_str());
   }
 
   ~MuJoCoSimulatorNode() override {
@@ -89,6 +93,8 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
     declare_parameter("publish_decimation", 1);
     // sync_step: max time to wait for a command before using previous (ms)
     declare_parameter("sync_timeout_ms", 50.0);
+    // Maximum Real-Time Factor (0.0 = unlimited)
+    declare_parameter("max_rtf", 0.0);
 
     // Initial joint positions (UR5e safe upright pose)
     declare_parameter("initial_joint_positions",
@@ -101,6 +107,7 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
     sim_mode_            = get_parameter("sim_mode").as_string();
     publish_decimation_  = get_parameter("publish_decimation").as_int();
     sync_timeout_ms_     = get_parameter("sync_timeout_ms").as_double();
+    max_rtf_             = get_parameter("max_rtf").as_double();
 
     // Resolve model path: if empty or relative, locate via ament index.
     if (model_path_.empty() || model_path_[0] != '/') {
@@ -138,6 +145,7 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
         .enable_viewer       = enable_viewer_,
         .publish_decimation  = publish_decimation_,
         .sync_timeout_ms     = sync_timeout_ms_,
+        .max_rtf             = max_rtf_,
         .initial_qpos        = initial_qpos_,
     };
     sim_ = std::make_unique<urtc::MuJoCoSimulator>(std::move(cfg));
@@ -302,6 +310,7 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
   std::string            sim_mode_{"free_run"};
   int                    publish_decimation_{1};
   double                 sync_timeout_ms_{50.0};
+  double                 max_rtf_{0.0};
   std::array<double, 6>  initial_qpos_{0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0};
 };
 
