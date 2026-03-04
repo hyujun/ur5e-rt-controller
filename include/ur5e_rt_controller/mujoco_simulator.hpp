@@ -37,14 +37,24 @@ namespace ur5e_rt_controller {
 //   - Gravity toggle: EnableGravity(false) for zero-g testing
 //   - Body perturbation: Ctrl+drag in viewer applies mjvPerturb spring forces
 //   - External force API: SetExternalForce() / ClearExternalForce()
+//   - Contact toggle: SetContactEnabled(false) for free-space debugging
+//   - Solver stats: GetSolverStats() → {improvement, gradient, iter, ncon}
+//   - Integrator: Euler / RK4 / Implicit / ImplicitFast (SetIntegrator)
+//   - Solver: PGS / CG / Newton (SetSolverType)
+//   - Iterations / tolerance: SetSolverIterations(), SetSolverTolerance()
 //
 // Runtime controls (thread-safe):
 //   Pause() / Resume() / IsPaused()
-//   RequestReset()        — reinitialise to cfg_.initial_qpos
-//   SetMaxRtf(double)     — adjust speed cap at runtime
-//   EnableGravity(bool)   — toggle gravity (picked up by sim thread)
-//   SetExternalForce()    — apply world-frame wrench to a body
-//   ClearExternalForce()  — remove all external forces
+//   RequestReset()          — reinitialise to cfg_.initial_qpos
+//   SetMaxRtf(double)       — adjust speed cap at runtime
+//   EnableGravity(bool)     — toggle gravity (picked up by sim thread)
+//   SetContactEnabled(bool) — enable/disable contact constraints
+//   SetIntegrator(int)      — mjINT_EULER/RK4/IMPLICIT/IMPLICITFAST
+//   SetSolverType(int)      — mjSOL_PGS/CG/NEWTON
+//   SetSolverIterations(int) — max constraint solver iterations
+//   SetSolverTolerance(double) — convergence tolerance
+//   SetExternalForce()      — apply world-frame wrench to a body
+//   ClearExternalForce()    — remove all external forces
 //
 // Viewer keyboard shortcuts (MUJOCO_HAVE_GLFW):
 //   F1            — toggle detailed help overlay (keys + current state)
@@ -53,11 +63,17 @@ namespace ur5e_rt_controller {
 //   - / KP_SUB   — halve max_rtf (≤0.5x → unlimited)
 //   R             — reset simulation to initial pose
 //   G             — toggle gravity
+//   N             — toggle contact constraints
+//   I             — cycle integrator (Euler→RK4→Implicit→ImplFast)
+//   S             — cycle solver type (PGS→CG→Newton)
+//   ]             — double solver iterations
+//   [             — halve solver iterations
 //   C             — toggle contact point markers
 //   F             — toggle contact force arrows
 //   V             — toggle collision geometry display
 //   T             — toggle transparency
 //   F3            — toggle RTF profiler graph
+//   F4            — toggle solver stats overlay
 //   Backspace     — reset visualisation options
 //   Escape        — reset camera to default position
 //
@@ -96,6 +112,15 @@ class MuJoCoSimulator {
     double      max_rtf{0.0};           // 0.0 = unlimited
     std::array<double, 6> initial_qpos{
         0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0};
+
+    // ── Physics solver ────────────────────────────────────────────────────────
+    // integrator_type: mjINT_EULER(0) | mjINT_RK4(1) | mjINT_IMPLICIT(2)
+    //                  mjINT_IMPLICITFAST(3)
+    int    integrator_type{mjINT_EULER};
+    // solver_type: mjSOL_PGS(0) | mjSOL_CG(1) | mjSOL_NEWTON(2)
+    int    solver_type{mjSOL_NEWTON};
+    int    solver_iterations{100};       // max constraint solver iterations
+    double solver_tolerance{1e-8};       // convergence tolerance (0 = disabled)
   };
 
   // Invoked from SimLoop after each publish step.
@@ -131,6 +156,59 @@ class MuJoCoSimulator {
   [[nodiscard]] std::array<double, 6> GetPositions()  const noexcept;
   [[nodiscard]] std::array<double, 6> GetVelocities() const noexcept;
   [[nodiscard]] std::array<double, 6> GetEfforts()    const noexcept;
+
+  // Solver statistics snapshot captured after each mj_step().
+  struct SolverStats {
+    double improvement{0.0};  // constraint violation improvement (last iter)
+    double gradient{0.0};     // gradient norm at convergence
+    int    iter{0};           // solver iterations actually used
+    int    ncon{0};           // number of active contacts
+  };
+  [[nodiscard]] SolverStats GetSolverStats() const noexcept;
+
+  // ── Physics solver controls (thread-safe) ─────────────────────────────────
+
+  // Integrator: mjINT_EULER(0) | mjINT_RK4(1) | mjINT_IMPLICIT(2) | mjINT_IMPLICITFAST(3)
+  // Applied by sim thread before the next mj_step().
+  void SetIntegrator(int type) noexcept {
+    solver_integrator_.store(type, std::memory_order_relaxed);
+  }
+  [[nodiscard]] int GetIntegrator() const noexcept {
+    return solver_integrator_.load(std::memory_order_relaxed);
+  }
+
+  // Solver: mjSOL_PGS(0) | mjSOL_CG(1) | mjSOL_NEWTON(2)
+  void SetSolverType(int type) noexcept {
+    solver_type_.store(type, std::memory_order_relaxed);
+  }
+  [[nodiscard]] int GetSolverType() const noexcept {
+    return solver_type_.load(std::memory_order_relaxed);
+  }
+
+  // Max solver iterations (clamped to [1, 1000]).
+  void SetSolverIterations(int iters) noexcept {
+    solver_iterations_.store(
+        std::max(1, std::min(iters, 1000)), std::memory_order_relaxed);
+  }
+  [[nodiscard]] int GetSolverIterations() const noexcept {
+    return solver_iterations_.load(std::memory_order_relaxed);
+  }
+
+  // Solver convergence tolerance (0.0 = disabled).
+  void SetSolverTolerance(double tol) noexcept {
+    solver_tolerance_.store(tol < 0.0 ? 0.0 : tol, std::memory_order_relaxed);
+  }
+  [[nodiscard]] double GetSolverTolerance() const noexcept {
+    return solver_tolerance_.load(std::memory_order_relaxed);
+  }
+
+  // Enable / disable contact constraints (mjDSBL_CONTACT).
+  void SetContactEnabled(bool enabled) noexcept {
+    contacts_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  [[nodiscard]] bool IsContactEnabled() const noexcept {
+    return contacts_enabled_.load(std::memory_order_relaxed);
+  }
 
   // ── Physics controls (thread-safe) ────────────────────────────────────────
 
@@ -203,6 +281,17 @@ class MuJoCoSimulator {
   std::atomic<bool>   gravity_enabled_{true};
   double              original_gravity_z_{-9.81};  // from model, set in Initialize()
 
+  // ── Physics solver atomics (applied in PreparePhysicsStep) ────────────────
+  std::atomic<int>    solver_integrator_{mjINT_EULER};
+  std::atomic<int>    solver_type_{mjSOL_NEWTON};
+  std::atomic<int>    solver_iterations_{100};
+  std::atomic<double> solver_tolerance_{1e-8};
+  std::atomic<bool>   contacts_enabled_{true};
+
+  // ── Solver statistics (written by sim thread, read by viewer) ─────────────
+  mutable std::mutex solver_stats_mutex_;
+  SolverStats        latest_solver_stats_{};
+
   // ── Command buffer ────────────────────────────────────────────────────────
   mutable std::mutex    cmd_mutex_;
   std::atomic<bool>     cmd_pending_{false};
@@ -254,12 +343,14 @@ class MuJoCoSimulator {
   void ResolveJointIndices() noexcept;
   void ApplyCommand() noexcept;
   void ReadState() noexcept;
+  // Capture solver statistics from data_ after mj_step().
+  void ReadSolverStats() noexcept;
   void InvokeStateCallback() noexcept;
   void UpdateVizBuffer() noexcept;
   void UpdateRtf(uint64_t step) noexcept;
   void ThrottleIfNeeded() noexcept;
   void HandleReset() noexcept;
-  // Apply gravity, external forces, and perturbation before mj_step().
+  // Apply solver params, gravity, external forces, and perturbation before mj_step().
   void PreparePhysicsStep() noexcept;
   // Clear xfrc_applied after mj_step().
   void ClearContactForces() noexcept;
@@ -332,6 +423,17 @@ inline bool MuJoCoSimulator::Initialize() noexcept {
 
   // Store original gravity for toggle
   original_gravity_z_ = static_cast<double>(model_->opt.gravity[2]);
+
+  // Apply initial solver configuration from Config
+  model_->opt.integrator  = static_cast<mjtIntegrator>(cfg_.integrator_type);
+  model_->opt.solver      = static_cast<mjtSolver>(cfg_.solver_type);
+  model_->opt.iterations  = cfg_.solver_iterations;
+  model_->opt.tolerance   = static_cast<mjtNum>(cfg_.solver_tolerance);
+  // Sync atomics with config values
+  solver_integrator_.store(cfg_.integrator_type,  std::memory_order_relaxed);
+  solver_type_.store(cfg_.solver_type,             std::memory_order_relaxed);
+  solver_iterations_.store(cfg_.solver_iterations, std::memory_order_relaxed);
+  solver_tolerance_.store(cfg_.solver_tolerance,   std::memory_order_relaxed);
 
   // Pre-size external force buffer
   viz_qpos_.assign(static_cast<std::size_t>(model_->nq), 0.0);
@@ -460,6 +562,25 @@ inline void MuJoCoSimulator::ReadState() noexcept {
   }
 }
 
+inline void MuJoCoSimulator::ReadSolverStats() noexcept {
+  if (!data_) { return; }
+  SolverStats s{};
+  s.ncon = data_->ncon;
+  s.iter = data_->solver_iter;
+  // mjSolverStat[0] holds aggregate stats for the last solve.
+  if (s.iter > 0) {
+    s.improvement = static_cast<double>(data_->solver[0].improvement);
+    s.gradient    = static_cast<double>(data_->solver[0].gradient);
+  }
+  std::lock_guard lock(solver_stats_mutex_);
+  latest_solver_stats_ = s;
+}
+
+inline MuJoCoSimulator::SolverStats MuJoCoSimulator::GetSolverStats() const noexcept {
+  std::lock_guard lock(solver_stats_mutex_);
+  return latest_solver_stats_;
+}
+
 inline void MuJoCoSimulator::InvokeStateCallback() noexcept {
   if (!state_cb_) { return; }
   std::array<double, 6> pos{}, vel{}, eff{};
@@ -521,7 +642,23 @@ inline void MuJoCoSimulator::ThrottleIfNeeded() noexcept {
 //   3. Apply mjvPerturb spring force (viewer Ctrl+drag).
 //
 inline void MuJoCoSimulator::PreparePhysicsStep() noexcept {
-  // 1. Gravity toggle (cheap relaxed load)
+  // 1. Physics solver parameters (integrator, solver type, iterations, tolerance)
+  model_->opt.integrator =
+      static_cast<mjtIntegrator>(solver_integrator_.load(std::memory_order_relaxed));
+  model_->opt.solver =
+      static_cast<mjtSolver>(solver_type_.load(std::memory_order_relaxed));
+  model_->opt.iterations = solver_iterations_.load(std::memory_order_relaxed);
+  model_->opt.tolerance  =
+      static_cast<mjtNum>(solver_tolerance_.load(std::memory_order_relaxed));
+
+  // 2. Contact enable / disable (mjDSBL_CONTACT flag)
+  if (contacts_enabled_.load(std::memory_order_relaxed)) {
+    model_->opt.disableflags &= ~mjDSBL_CONTACT;
+  } else {
+    model_->opt.disableflags |= mjDSBL_CONTACT;
+  }
+
+  // 3. Gravity toggle (cheap relaxed load)
   model_->opt.gravity[2] =
       gravity_enabled_.load(std::memory_order_relaxed)
       ? static_cast<mjtNum>(original_gravity_z_)
@@ -619,6 +756,7 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
     PreparePhysicsStep();
     mj_step(model_, data_);
     ClearContactForces();
+    ReadSolverStats();
 
     ++step;
     step_count_.store(step, std::memory_order_relaxed);
@@ -691,6 +829,7 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
     PreparePhysicsStep();
     mj_step(model_, data_);
     ClearContactForces();
+    ReadSolverStats();
 
     ++step;
     step_count_.store(step, std::memory_order_relaxed);
@@ -797,6 +936,7 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
     // UI toggles
     bool show_profiler{false};
     bool show_help{false};
+    bool show_solver{false};  // F4: solver stats overlay
 
     // RTF rolling buffer (200 samples at ~60 Hz ≈ 3.3 s window)
     static constexpr int kProfLen = 200;
@@ -904,9 +1044,65 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
           s->opt->flags[mjVIS_TRANSPARENT] ^= 1;
           break;
 
+        // ── Physics solver controls ───────────────────────────────────────
+        case GLFW_KEY_I: {
+          // Cycle integrator: Euler → RK4 → Implicit → ImplicitFast → Euler
+          static constexpr int kIntegrators[] = {
+              mjINT_EULER, mjINT_RK4, mjINT_IMPLICIT, mjINT_IMPLICITFAST};
+          static constexpr const char* kIntNames[] = {
+              "Euler", "RK4", "Implicit", "ImplicitFast"};
+          const int cur = s->sim->GetIntegrator();
+          int next = 0;
+          for (int k = 0; k < 4; ++k) {
+            if (kIntegrators[k] == cur) { next = (k + 1) % 4; break; }
+          }
+          s->sim->SetIntegrator(kIntegrators[next]);
+          fprintf(stdout, "[Viewer] Integrator → %s\n", kIntNames[next]);
+          break;
+        }
+
+        case GLFW_KEY_S: {
+          // Cycle solver: PGS → CG → Newton → PGS
+          static constexpr int kSolvers[] = {mjSOL_PGS, mjSOL_CG, mjSOL_NEWTON};
+          static constexpr const char* kSolNames[] = {"PGS", "CG", "Newton"};
+          const int cur = s->sim->GetSolverType();
+          int next = 0;
+          for (int k = 0; k < 3; ++k) {
+            if (kSolvers[k] == cur) { next = (k + 1) % 3; break; }
+          }
+          s->sim->SetSolverType(kSolvers[next]);
+          fprintf(stdout, "[Viewer] Solver → %s\n", kSolNames[next]);
+          break;
+        }
+
+        case GLFW_KEY_RIGHT_BRACKET:
+          // ] → double solver iterations (max 1000)
+          s->sim->SetSolverIterations(s->sim->GetSolverIterations() * 2);
+          fprintf(stdout, "[Viewer] Solver iterations → %d\n",
+                  s->sim->GetSolverIterations());
+          break;
+
+        case GLFW_KEY_LEFT_BRACKET:
+          // [ → halve solver iterations (min 1)
+          s->sim->SetSolverIterations(s->sim->GetSolverIterations() / 2);
+          fprintf(stdout, "[Viewer] Solver iterations → %d\n",
+                  s->sim->GetSolverIterations());
+          break;
+
+        case GLFW_KEY_N:
+          // Toggle contact constraints
+          s->sim->SetContactEnabled(!s->sim->IsContactEnabled());
+          fprintf(stdout, "[Viewer] Contacts %s\n",
+                  s->sim->IsContactEnabled() ? "ENABLED" : "DISABLED");
+          break;
+
         // ── Viewer controls ───────────────────────────────────────────────
         case GLFW_KEY_F3:
           s->show_profiler = !s->show_profiler;
+          break;
+
+        case GLFW_KEY_F4:
+          s->show_solver = !s->show_solver;
           break;
 
         case GLFW_KEY_BACKSPACE:
@@ -1015,11 +1211,12 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
   fprintf(stdout,
           "[MuJoCoSimulator] Viewer ready — press F1 in the window for help\n"
-          "  Keyboard: F1=help  Space=pause  +/-=speed  R=reset  G=gravity"
-          "  C=contacts  F=forces  V=geoms  T=transparent  F3=profiler"
-          "  Esc=camera\n"
-          "  Mouse: Left-drag=orbit  Right-drag=pan  Scroll=zoom"
-          "  Ctrl+Left-drag=perturb body\n");
+          "  Simulation: Space=pause  +/-=speed  R=reset\n"
+          "  Physics:    G=gravity  N=contacts\n"
+          "  Solver:     I=integrator  S=solver  ]/[=iterations  F4=stats\n"
+          "  Visualise:  C=cpoints  F=cforces  V=geoms  T=transp  F3=profiler\n"
+          "  Camera:     Left-drag=orbit  Right-drag=pan  Scroll=zoom  Esc=reset\n"
+          "  Perturb:    Ctrl+Left-drag=apply force to body\n");
 
   // ── Render loop ────────────────────────────────────────────────────────────
   while (!stop.stop_requested() && running_.load() &&
@@ -1067,19 +1264,33 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
         limit_str[sizeof(limit_str) - 1] = '\0';
       }
 
-      char labels[256], values[256];
+      // Solver stats snapshot
+      const SolverStats ss = GetSolverStats();
+      static constexpr const char* kIntNames[]  = {"Euler","RK4","Implicit","ImplFast"};
+      static constexpr const char* kSolNames[]  = {"PGS","CG","Newton"};
+      const int int_idx = std::max(0, std::min(GetIntegrator(), 3));
+      const int sol_idx = std::max(0, std::min(GetSolverType(), 2));
+
+      char labels[512], values[512];
       std::snprintf(labels, sizeof(labels),
-                    "Mode\nRTF\nLimit\nSim Time\nSteps\nContacts\nGravity\nStatus");
+                    "Mode\nRTF\nLimit\nSim Time\nSteps\nContacts\nGravity\nStatus\n"
+                    "Integrator\nSolver\nIterations\nResidual");
       std::snprintf(values, sizeof(values),
-                    "%s\n%.1fx\n%s\n%.2f s\n%lu\n%d\n%s\n%s",
+                    "%s\n%.1fx\n%s\n%.2f s\n%lu\n%d/%s\n%s\n%s\n"
+                    "%s\n%s\n%d/%d\n%.2e",
                     cfg_.mode == SimMode::kFreeRun ? "free_run" : "sync_step",
                     static_cast<double>(cur_rtf),
                     limit_str,
                     sim_time_sec_.load(std::memory_order_relaxed),
                     static_cast<unsigned long>(step_count_.load()),
-                    ncon_snap,
-                    grav_on   ? "ON"       : "OFF",
-                    is_paused ? "PAUSED"   : (perturbing ? "perturb" : "running"));
+                    ss.ncon,
+                    contacts_enabled_.load(std::memory_order_relaxed) ? "on" : "OFF",
+                    grav_on   ? "ON"     : "OFF",
+                    is_paused ? "PAUSED" : (perturbing ? "perturb" : "running"),
+                    kIntNames[int_idx],
+                    kSolNames[sol_idx],
+                    ss.iter, GetSolverIterations(),
+                    ss.improvement);
       mjr_overlay(mjFONT_NORMAL, mjGRID_TOPRIGHT, viewport,
                   labels, values, &con);
     }
@@ -1100,7 +1311,14 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
         rtf_str[sizeof(rtf_str) - 1] = '\0';
       }
 
-      char help_keys[512], help_vals[512];
+      // Current solver labels for help overlay
+      static constexpr const char* kHelpIntNames[] =
+          {"Euler","RK4","Implicit","ImplFast"};
+      static constexpr const char* kHelpSolNames[] = {"PGS","CG","Newton"};
+      const int h_int = std::max(0, std::min(GetIntegrator(), 3));
+      const int h_sol = std::max(0, std::min(GetSolverType(), 2));
+
+      char help_keys[768], help_vals[768];
       std::snprintf(help_keys, sizeof(help_keys),
           "── Simulation ──\n"
           "Space\n"
@@ -1109,6 +1327,12 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
           "R\n"
           "── Physics ──\n"
           "G\n"
+          "N\n"
+          "── Solver ──\n"
+          "I\n"
+          "S\n"
+          "]  /  [\n"
+          "F4\n"
           "── Visualisation ──\n"
           "C\n"
           "F\n"
@@ -1133,6 +1357,12 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
           "Reset to initial pose\n"
           "\n"
           "Toggle gravity  [%s]\n"
+          "Toggle contacts  [%s]\n"
+          "\n"
+          "Cycle integrator  [%s]\n"
+          "Cycle solver type  [%s]\n"
+          "Increase / decrease iterations  [%d]\n"
+          "Toggle solver stats overlay  [%s]\n"
           "\n"
           "Toggle contact points  [%s]\n"
           "Toggle contact forces  [%s]\n"
@@ -1151,6 +1381,11 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
           "Hide help",
           rtf_str,
           gravity_enabled_.load(std::memory_order_relaxed) ? "ON"  : "OFF",
+          contacts_enabled_.load(std::memory_order_relaxed) ? "ON" : "OFF",
+          kHelpIntNames[h_int],
+          kHelpSolNames[h_sol],
+          GetSolverIterations(),
+          vs.show_solver                  ? "ON" : "OFF",
           (opt.flags[mjVIS_CONTACTPOINT]) ? "ON" : "OFF",
           (opt.flags[mjVIS_CONTACTFORCE]) ? "ON" : "OFF",
           (opt.geomgroup[0])              ? "ON" : "OFF",
@@ -1159,6 +1394,30 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
       mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, viewport,
                   help_keys, help_vals, &con);
+    }
+
+    // ── Solver stats overlay (bottom-left extended, F4) ─────────────────────
+    if (vs.show_solver) {
+      const SolverStats ss2 = GetSolverStats();
+      static constexpr const char* kOvIntNames[] =
+          {"Euler","RK4","Implicit","ImplFast"};
+      static constexpr const char* kOvSolNames[] = {"PGS","CG","Newton"};
+      const int oi = std::max(0, std::min(GetIntegrator(), 3));
+      const int os = std::max(0, std::min(GetSolverType(), 2));
+
+      char sk[256], sv[256];
+      std::snprintf(sk, sizeof(sk),
+                    "Integrator\nSolver\nMax iter\nUsed iter\n"
+                    "Improvement\nGradient\nContacts\nTimestep");
+      std::snprintf(sv, sizeof(sv),
+                    "%s\n%s\n%d\n%d\n"
+                    "%.3e\n%.3e\n%d\n%.4f ms",
+                    kOvIntNames[oi], kOvSolNames[os],
+                    GetSolverIterations(), ss2.iter,
+                    ss2.improvement, ss2.gradient,
+                    ss2.ncon,
+                    model_ ? static_cast<double>(model_->opt.timestep) * 1e3 : 0.0);
+      mjr_overlay(mjFONT_NORMAL, mjGRID_BOTTOMLEFT, viewport, sk, sv, &con);
     }
 
     // ── Profiler (bottom-right, F3) ───────────────────────────────────────────
