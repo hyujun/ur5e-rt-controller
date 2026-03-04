@@ -35,6 +35,9 @@ if(mujoco_FOUND)
 
   add_executable(mujoco_simulator_node
     src/mujoco_simulator_node.cpp
+    src/mujoco_simulator.cpp
+    src/mujoco_sim_loop.cpp
+    src/mujoco_viewer.cpp
   )
   target_include_directories(mujoco_simulator_node PRIVATE include)
   ament_target_dependencies(mujoco_simulator_node
