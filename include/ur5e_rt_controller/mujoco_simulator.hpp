@@ -47,6 +47,7 @@ namespace ur5e_rt_controller {
 //   ClearExternalForce()  — remove all external forces
 //
 // Viewer keyboard shortcuts (MUJOCO_HAVE_GLFW):
+//   F1            — toggle detailed help overlay (keys + current state)
 //   Space         — pause / resume
 //   + / KP_ADD   — double max_rtf (unlimited → 2x)
 //   - / KP_SUB   — halve max_rtf (≤0.5x → unlimited)
@@ -55,6 +56,7 @@ namespace ur5e_rt_controller {
 //   C             — toggle contact point markers
 //   F             — toggle contact force arrows
 //   V             — toggle collision geometry display
+//   T             — toggle transparency
 //   F3            — toggle RTF profiler graph
 //   Backspace     — reset visualisation options
 //   Escape        — reset camera to default position
@@ -794,6 +796,7 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
     // UI toggles
     bool show_profiler{false};
+    bool show_help{false};
 
     // RTF rolling buffer (200 samples at ~60 Hz ≈ 3.3 s window)
     static constexpr int kProfLen = 200;
@@ -844,6 +847,11 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
       if (action == GLFW_RELEASE) { return; }
 
       switch (key) {
+        // ── Help overlay ──────────────────────────────────────────────────
+        case GLFW_KEY_F1:
+          s->show_help = !s->show_help;
+          break;
+
         // ── Simulation controls ──────────────────────────────────────────
         case GLFW_KEY_SPACE:
           if (s->sim->IsPaused()) { s->sim->Resume(); }
@@ -1006,8 +1014,8 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
     });
 
   fprintf(stdout,
-          "[MuJoCoSimulator] Viewer ready\n"
-          "  Keyboard: Space=pause  +/-=speed  R=reset  G=gravity"
+          "[MuJoCoSimulator] Viewer ready — press F1 in the window for help\n"
+          "  Keyboard: F1=help  Space=pause  +/-=speed  R=reset  G=gravity"
           "  C=contacts  F=forces  V=geoms  T=transparent  F3=profiler"
           "  Esc=camera\n"
           "  Mouse: Left-drag=orbit  Right-drag=pan  Scroll=zoom"
@@ -1076,13 +1084,82 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
                   labels, values, &con);
     }
 
-    // ── Help overlay (bottom-left) ────────────────────────────────────────────
+    // ── Help hint (bottom-left, always visible) ───────────────────────────────
     mjr_overlay(mjFONT_NORMAL, mjGRID_BOTTOMLEFT, viewport,
-                "Space:pause  +/-:speed  R:reset  G:gravity  C:contacts"
-                "  F:forces  V:geoms  T:transp  F3:profiler  Esc:camera\n"
-                "Left-drag:orbit  Right-drag:pan  Scroll:zoom"
-                "  Ctrl+Left-drag:perturb",
+                "F1: toggle help",
                 nullptr, &con);
+
+    // ── Detailed help overlay (top-left, F1 toggle) ───────────────────────────
+    if (vs.show_help) {
+      const double max_rtf_now = current_max_rtf_.load(std::memory_order_relaxed);
+      char rtf_str[32];
+      if (max_rtf_now > 0.0) {
+        std::snprintf(rtf_str, sizeof(rtf_str), "%.1fx", max_rtf_now);
+      } else {
+        std::strncpy(rtf_str, "unlimited", sizeof(rtf_str) - 1);
+        rtf_str[sizeof(rtf_str) - 1] = '\0';
+      }
+
+      char help_keys[512], help_vals[512];
+      std::snprintf(help_keys, sizeof(help_keys),
+          "── Simulation ──\n"
+          "Space\n"
+          "+  /  KP_ADD\n"
+          "-  /  KP_SUB\n"
+          "R\n"
+          "── Physics ──\n"
+          "G\n"
+          "── Visualisation ──\n"
+          "C\n"
+          "F\n"
+          "V\n"
+          "T\n"
+          "F3\n"
+          "Backspace\n"
+          "Escape\n"
+          "── Camera ──\n"
+          "Left drag\n"
+          "Right drag\n"
+          "Scroll\n"
+          "── Perturb ──\n"
+          "Ctrl + Left drag\n"
+          "── Help ──\n"
+          "F1");
+      std::snprintf(help_vals, sizeof(help_vals),
+          "\n"
+          "Pause / Resume\n"
+          "2x speed  [now %s]\n"
+          "0.5x speed\n"
+          "Reset to initial pose\n"
+          "\n"
+          "Toggle gravity  [%s]\n"
+          "\n"
+          "Toggle contact points  [%s]\n"
+          "Toggle contact forces  [%s]\n"
+          "Toggle collision geoms  [%s]\n"
+          "Toggle transparency  [%s]\n"
+          "Toggle RTF profiler  [%s]\n"
+          "Reset visualisation options\n"
+          "Reset camera to default\n"
+          "\n"
+          "Orbit camera\n"
+          "Pan camera\n"
+          "Zoom in / out\n"
+          "\n"
+          "Apply spring force to body\n"
+          "\n"
+          "Hide help",
+          rtf_str,
+          gravity_enabled_.load(std::memory_order_relaxed) ? "ON"  : "OFF",
+          (opt.flags[mjVIS_CONTACTPOINT]) ? "ON" : "OFF",
+          (opt.flags[mjVIS_CONTACTFORCE]) ? "ON" : "OFF",
+          (opt.geomgroup[0])              ? "ON" : "OFF",
+          (opt.flags[mjVIS_TRANSPARENT])  ? "ON" : "OFF",
+          vs.show_profiler                ? "ON" : "OFF");
+
+      mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, viewport,
+                  help_keys, help_vals, &con);
+    }
 
     // ── Profiler (bottom-right, F3) ───────────────────────────────────────────
     if (vs.show_profiler && vs.rtf_count > 0) {
