@@ -8,6 +8,7 @@
 #include <GLFW/glfw3.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -27,41 +29,54 @@ namespace ur5e_rt_controller {
 //
 // Simulation modes:
 //   kFreeRun  — advances mj_step() as fast as possible (up to max_rtf).
-//               Best for algorithm validation, trajectory generation.
-//   kSyncStep — publishes state, waits for one controller command, then takes
-//               one physics step.  Step latency ≈ controller Compute() time.
+//   kSyncStep — publishes state, waits for one command, steps once.
+//               Step latency ≈ controller Compute() time.
 //
-// Runtime controls (thread-safe, call from any thread):
-//   Pause()        — freeze physics without stopping the viewer
-//   Resume()       — resume physics
-//   RequestReset() — reinitialise to cfg_.initial_qpos (sim thread picks it up)
-//   SetMaxRtf()    — adjust speed cap at runtime (+/- keys in viewer)
+// Physics features:
+//   - Joint efforts (torques) via data_->qfrc_actuator in StateCallback
+//   - Gravity toggle: EnableGravity(false) for zero-g testing
+//   - Body perturbation: Ctrl+drag in viewer applies mjvPerturb spring forces
+//   - External force API: SetExternalForce() / ClearExternalForce()
 //
-// Viewer keyboard shortcuts (MUJOCO_HAVE_GLFW only):
+// Runtime controls (thread-safe):
+//   Pause() / Resume() / IsPaused()
+//   RequestReset()        — reinitialise to cfg_.initial_qpos
+//   SetMaxRtf(double)     — adjust speed cap at runtime
+//   EnableGravity(bool)   — toggle gravity (picked up by sim thread)
+//   SetExternalForce()    — apply world-frame wrench to a body
+//   ClearExternalForce()  — remove all external forces
+//
+// Viewer keyboard shortcuts (MUJOCO_HAVE_GLFW):
 //   Space         — pause / resume
-//   + / KP_ADD   — double max_rtf (speed up; unlimited → 2x)
-//   - / KP_SUB   — halve max_rtf (slow down; ≤0.5x → unlimited)
+//   + / KP_ADD   — double max_rtf (unlimited → 2x)
+//   - / KP_SUB   — halve max_rtf (≤0.5x → unlimited)
 //   R             — reset simulation to initial pose
+//   G             — toggle gravity
+//   C             — toggle contact point markers
+//   F             — toggle contact force arrows
+//   V             — toggle collision geometry display
 //   F3            — toggle RTF profiler graph
 //   Backspace     — reset visualisation options
 //   Escape        — reset camera to default position
 //
 // Viewer mouse controls:
-//   Left drag     — orbit (rotate) camera
-//   Right drag    — pan (translate) camera
-//   Scroll        — zoom in / out
+//   Left drag          — orbit (rotate) camera
+//   Right drag         — pan (translate) camera
+//   Scroll             — zoom in / out
+//   Ctrl + Left drag   — apply perturbation force to hovered body
 //
 // Threading model:
-//   SimLoop thread  — runs SimLoopFreeRun or SimLoopSyncStep.
-//   ViewerLoop thread — renders scene at ~60 Hz via GLFW (optional).
-//   Caller thread   — calls SetCommand(), GetPositions(), GetVelocities().
+//   SimLoop thread  — physics; sole writer of model_/data_
+//   ViewerLoop thread — renders at ~60 Hz via GLFW (optional)
+//   Caller thread   — SetCommand(), GetPositions(), SetExternalForce(), etc.
 //
 // Synchronisation:
-//   cmd_mutex_   — protects pending_cmd_ (caller → sim write)
-//   cmd_pending_ — atomic flag for lock-free fast-path in FreeRun mode
-//   sync_cv_     — condition variable to wake SimLoopSyncStep on command
-//   state_mutex_ — protects latest_positions_ / latest_velocities_
-//   viz_mutex_   — protects viz_qpos_ / viz_ncon_ (try_lock avoids blocking SimLoop)
+//   cmd_mutex_   — pending_cmd_
+//   cmd_pending_ — lock-free flag for FreeRun fast path
+//   sync_cv_     — wakes SimLoopSyncStep on command/resume/reset
+//   state_mutex_ — latest_positions_ / latest_velocities_ / latest_efforts_
+//   viz_mutex_   — viz_qpos_ / viz_ncon_ (try_lock, never blocks SimLoop)
+//   pert_mutex_  — shared_pert_ (viewer → sim perturbation transfer)
 //
 class MuJoCoSimulator {
  public:
@@ -82,9 +97,11 @@ class MuJoCoSimulator {
   };
 
   // Invoked from SimLoop after each publish step.
+  // efforts = data_->qfrc_actuator (actuator forces in Nm, indexed by DOF).
   using StateCallback = std::function<void(
       const std::array<double, 6>& positions,
-      const std::array<double, 6>& velocities)>;
+      const std::array<double, 6>& velocities,
+      const std::array<double, 6>& efforts)>;
 
   explicit MuJoCoSimulator(Config cfg) noexcept;
   ~MuJoCoSimulator();
@@ -103,25 +120,35 @@ class MuJoCoSimulator {
   // Signal stop and join all threads.
   void Stop() noexcept;
 
-  // Write a position command into the pending buffer.
-  // Thread-safe.  In kSyncStep mode also wakes the simulation loop.
+  // Write a position command into the pending buffer.  Thread-safe.
   void SetCommand(const std::array<double, 6>& cmd) noexcept;
 
-  // Register the callback invoked after each publish step.
+  // Register the state callback (positions, velocities, efforts).
   void SetStateCallback(StateCallback cb) noexcept;
 
   [[nodiscard]] std::array<double, 6> GetPositions()  const noexcept;
   [[nodiscard]] std::array<double, 6> GetVelocities() const noexcept;
+  [[nodiscard]] std::array<double, 6> GetEfforts()    const noexcept;
 
-  // ── Runtime controls (thread-safe) ────────────────────────────────────────
+  // ── Physics controls (thread-safe) ────────────────────────────────────────
+
+  // Pause / resume physics.  The viewer continues to render.
   void Pause()   noexcept { paused_.store(true,  std::memory_order_relaxed); }
-  void Resume()  noexcept { paused_.store(false, std::memory_order_relaxed); sync_cv_.notify_all(); }
-  [[nodiscard]] bool IsPaused() const noexcept { return paused_.load(std::memory_order_relaxed); }
+  void Resume()  noexcept {
+    paused_.store(false, std::memory_order_relaxed);
+    sync_cv_.notify_all();
+  }
+  [[nodiscard]] bool IsPaused() const noexcept {
+    return paused_.load(std::memory_order_relaxed);
+  }
 
-  // Request physics reset to cfg_.initial_qpos (executed on the sim thread).
-  void RequestReset() noexcept { reset_requested_.store(true, std::memory_order_relaxed); sync_cv_.notify_all(); }
+  // Request reset to cfg_.initial_qpos (sim thread executes it).
+  void RequestReset() noexcept {
+    reset_requested_.store(true, std::memory_order_relaxed);
+    sync_cv_.notify_all();
+  }
 
-  // Set maximum Real-Time Factor at runtime (0.0 = unlimited).
+  // Adjust RTF speed cap at runtime (0.0 = unlimited).
   void SetMaxRtf(double rtf) noexcept {
     current_max_rtf_.store(rtf < 0.0 ? 0.0 : rtf, std::memory_order_relaxed);
   }
@@ -129,13 +156,34 @@ class MuJoCoSimulator {
     return current_max_rtf_.load(std::memory_order_relaxed);
   }
 
+  // Toggle gravity.  Sim thread reads gravity_enabled_ before each mj_step().
+  void EnableGravity(bool enable) noexcept {
+    gravity_enabled_.store(enable, std::memory_order_relaxed);
+  }
+  [[nodiscard]] bool IsGravityEnabled() const noexcept {
+    return gravity_enabled_.load(std::memory_order_relaxed);
+  }
+
+  // Apply an external 6-DOF wrench [Fx,Fy,Fz,Tx,Ty,Tz] (world frame, SI units)
+  // to a specific body by index.  body_id == 0 is the world body (no effect).
+  // The force is applied every sim step until ClearExternalForce() is called.
+  void SetExternalForce(int body_id,
+                        const std::array<double, 6>& wrench_world) noexcept;
+  void ClearExternalForce() noexcept;
+
+  // Transfer a mjvPerturb state from the viewer to the sim thread.
+  // Called by ViewerLoop when Ctrl+drag is active.
+  void UpdatePerturb(const mjvPerturb& pert) noexcept;
+  void ClearPerturb() noexcept;
+
   // ── Status accessors ──────────────────────────────────────────────────────
   [[nodiscard]] bool     IsRunning()  const noexcept { return running_.load(); }
   [[nodiscard]] uint64_t StepCount()  const noexcept { return step_count_.load(); }
   [[nodiscard]] double   SimTimeSec() const noexcept { return sim_time_sec_.load(); }
   [[nodiscard]] int      NumJoints()  const noexcept { return model_ ? model_->nq : 0; }
-  // Real-Time Factor: sim_time / wall_time (updated every 200 steps).
-  [[nodiscard]] double   GetRtf()     const noexcept { return rtf_.load(std::memory_order_relaxed); }
+  [[nodiscard]] double   GetRtf()     const noexcept {
+    return rtf_.load(std::memory_order_relaxed);
+  }
 
  private:
   Config   cfg_;
@@ -149,26 +197,28 @@ class MuJoCoSimulator {
   // ── Runtime control flags ─────────────────────────────────────────────────
   std::atomic<bool>   paused_{false};
   std::atomic<bool>   reset_requested_{false};
-  std::atomic<double> current_max_rtf_{0.0};  // runtime-adjustable speed cap
+  std::atomic<double> current_max_rtf_{0.0};
+  std::atomic<bool>   gravity_enabled_{true};
+  double              original_gravity_z_{-9.81};  // from model, set in Initialize()
 
   // ── Command buffer ────────────────────────────────────────────────────────
   mutable std::mutex    cmd_mutex_;
   std::atomic<bool>     cmd_pending_{false};
   std::array<double, 6> pending_cmd_{};
 
-  // SyncStep synchronisation — woken by SetCommand(), Resume(), RequestReset(), Stop().
   std::mutex              sync_mutex_;
   std::condition_variable sync_cv_;
 
-  // ── State buffer ──────────────────────────────────────────────────────────
+  // ── State buffer (under state_mutex_) ─────────────────────────────────────
   mutable std::mutex    state_mutex_;
   std::array<double, 6> latest_positions_{};
   std::array<double, 6> latest_velocities_{};
+  std::array<double, 6> latest_efforts_{};   // qfrc_actuator per joint DOF
 
   // ── Viewer double-buffer ──────────────────────────────────────────────────
   mutable std::mutex  viz_mutex_;
   std::vector<double> viz_qpos_{};
-  int                 viz_ncon_{0};   // contact count snapshot for overlay
+  int                 viz_ncon_{0};
   bool                viz_dirty_{false};
 
   StateCallback state_cb_{nullptr};
@@ -176,7 +226,6 @@ class MuJoCoSimulator {
   std::jthread sim_thread_;
   std::jthread viewer_thread_;
 
-  // Joint index maps resolved from MJCF joint names at initialise time.
   std::array<int, 6> joint_qpos_indices_{0, 1, 2, 3, 4, 5};
   std::array<int, 6> joint_qvel_indices_{0, 1, 2, 3, 4, 5};
 
@@ -188,7 +237,16 @@ class MuJoCoSimulator {
   // ── Max-RTF throttle (sim thread only) ───────────────────────────────────
   std::chrono::steady_clock::time_point throttle_wall_start_{};
   double                                throttle_sim_start_{0.0};
-  double                                throttle_rtf_{0.0};  // last applied value (for change detection)
+  double                                throttle_rtf_{0.0};
+
+  // ── External forces / perturbation (under pert_mutex_) ───────────────────
+  mutable std::mutex pert_mutex_;
+  mjvPerturb         shared_pert_{};     // viewer → sim perturbation
+  bool               pert_active_{false};
+  // Flat xfrc_applied buffer: 6 * nbody doubles.
+  // Used by SetExternalForce(); shared_pert_ is applied separately.
+  std::vector<double> ext_xfrc_{};
+  bool                ext_xfrc_dirty_{false};
 
   // ── Internal helpers ───────────────────────────────────────────────────────
   void ResolveJointIndices() noexcept;
@@ -198,16 +256,18 @@ class MuJoCoSimulator {
   void UpdateVizBuffer() noexcept;
   void UpdateRtf(uint64_t step) noexcept;
   void ThrottleIfNeeded() noexcept;
-
-  // Reset physics to cfg_.initial_qpos.  Must be called from the sim thread.
   void HandleReset() noexcept;
+  // Apply gravity, external forces, and perturbation before mj_step().
+  void PreparePhysicsStep() noexcept;
+  // Clear xfrc_applied after mj_step().
+  void ClearContactForces() noexcept;
 
   void SimLoopFreeRun(std::stop_token stop) noexcept;
   void SimLoopSyncStep(std::stop_token stop) noexcept;
   void ViewerLoop(std::stop_token stop) noexcept;
 };
 
-// ── Joint name table (must match UR driver / custom_controller) ───────────────
+// ── Joint name table ───────────────────────────────────────────────────────────
 static constexpr std::array<const char*, 6> kMjJointNames = {
     "shoulder_pan_joint",
     "shoulder_lift_joint",
@@ -217,11 +277,14 @@ static constexpr std::array<const char*, 6> kMjJointNames = {
     "wrist_3_joint",
 };
 
-// ── Inline implementation ──────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Inline implementation
+// ═════════════════════════════════════════════════════════════════════════════
 
 inline MuJoCoSimulator::MuJoCoSimulator(Config cfg) noexcept
     : cfg_(std::move(cfg)) {
   current_max_rtf_.store(cfg_.max_rtf, std::memory_order_relaxed);
+  mjv_defaultPerturb(&shared_pert_);
 }
 
 inline MuJoCoSimulator::~MuJoCoSimulator() {
@@ -235,19 +298,15 @@ inline void MuJoCoSimulator::ResolveJointIndices() noexcept {
     const int jnt_id = mj_name2id(model_, mjOBJ_JOINT, kMjJointNames[i]);
     if (jnt_id < 0) {
       fprintf(stderr,
-              "[MuJoCoSimulator] Joint '%s' not found in model "
-              "— falling back to static index %zu\n",
+              "[MuJoCoSimulator] Joint '%s' not found — using static index %zu\n",
               kMjJointNames[i], i);
       joint_qpos_indices_[i] = static_cast<int>(i);
       joint_qvel_indices_[i] = static_cast<int>(i);
     } else {
       joint_qpos_indices_[i] = model_->jnt_qposadr[jnt_id];
       joint_qvel_indices_[i] = model_->jnt_dofadr[jnt_id];
-      fprintf(stdout,
-              "[MuJoCoSimulator] '%s' → qpos[%d]  qvel[%d]\n",
-              kMjJointNames[i],
-              joint_qpos_indices_[i],
-              joint_qvel_indices_[i]);
+      fprintf(stdout, "[MuJoCoSimulator] '%s' → qpos[%d]  qvel[%d]\n",
+              kMjJointNames[i], joint_qpos_indices_[i], joint_qvel_indices_[i]);
     }
   }
 }
@@ -269,25 +328,29 @@ inline bool MuJoCoSimulator::Initialize() noexcept {
     return false;
   }
 
+  // Store original gravity for toggle
+  original_gravity_z_ = static_cast<double>(model_->opt.gravity[2]);
+
+  // Pre-size external force buffer
   viz_qpos_.assign(static_cast<std::size_t>(model_->nq), 0.0);
+  ext_xfrc_.assign(static_cast<std::size_t>(model_->nbody) * 6, 0.0);
+
   ResolveJointIndices();
 
   const int njoints = std::min(6, model_->nq);
   for (int i = 0; i < njoints; ++i) {
     const double q0 = cfg_.initial_qpos[static_cast<std::size_t>(i)];
-    const int    qi = joint_qpos_indices_[static_cast<std::size_t>(i)];
-    data_->qpos[qi] = q0;
-    data_->ctrl[i]  = q0;
+    data_->qpos[joint_qpos_indices_[static_cast<std::size_t>(i)]] = q0;
+    data_->ctrl[i] = q0;
   }
-
   mj_forward(model_, data_);
   ReadState();
 
   fprintf(stdout,
-          "[MuJoCoSimulator] Loaded '%s'  nq=%d  nv=%d  nu=%d  dt=%.4f s"
-          "  mode=%s\n",
+          "[MuJoCoSimulator] Loaded '%s'  nq=%d  nv=%d  nu=%d  nbody=%d"
+          "  dt=%.4f s  mode=%s\n",
           cfg_.model_path.c_str(),
-          model_->nq, model_->nv, model_->nu,
+          model_->nq, model_->nv, model_->nu, model_->nbody,
           static_cast<double>(model_->opt.timestep),
           cfg_.mode == SimMode::kFreeRun ? "free_run" : "sync_step");
   return true;
@@ -301,7 +364,6 @@ inline void MuJoCoSimulator::Start() noexcept {
   } else {
     sim_thread_ = std::jthread([this](std::stop_token st) { SimLoopSyncStep(st); });
   }
-
   if (cfg_.enable_viewer) {
     viewer_thread_ = std::jthread([this](std::stop_token st) { ViewerLoop(st); });
   }
@@ -321,14 +383,9 @@ inline void MuJoCoSimulator::Stop() noexcept {
 }
 
 inline void MuJoCoSimulator::SetCommand(const std::array<double, 6>& cmd) noexcept {
-  {
-    std::lock_guard lock(cmd_mutex_);
-    pending_cmd_ = cmd;
-  }
+  { std::lock_guard lock(cmd_mutex_); pending_cmd_ = cmd; }
   cmd_pending_.store(true, std::memory_order_release);
-  if (cfg_.mode == SimMode::kSyncStep) {
-    sync_cv_.notify_one();
-  }
+  if (cfg_.mode == SimMode::kSyncStep) { sync_cv_.notify_one(); }
 }
 
 inline void MuJoCoSimulator::SetStateCallback(StateCallback cb) noexcept {
@@ -339,10 +396,44 @@ inline std::array<double, 6> MuJoCoSimulator::GetPositions() const noexcept {
   std::lock_guard lock(state_mutex_);
   return latest_positions_;
 }
-
 inline std::array<double, 6> MuJoCoSimulator::GetVelocities() const noexcept {
   std::lock_guard lock(state_mutex_);
   return latest_velocities_;
+}
+inline std::array<double, 6> MuJoCoSimulator::GetEfforts() const noexcept {
+  std::lock_guard lock(state_mutex_);
+  return latest_efforts_;
+}
+
+// ── Physics controls ──────────────────────────────────────────────────────────
+
+inline void MuJoCoSimulator::SetExternalForce(
+    int body_id, const std::array<double, 6>& wrench_world) noexcept {
+  if (body_id <= 0 || body_id >= model_->nbody) { return; }
+  std::lock_guard lock(pert_mutex_);
+  const std::size_t offset = static_cast<std::size_t>(body_id) * 6;
+  for (std::size_t i = 0; i < 6; ++i) {
+    ext_xfrc_[offset + i] = wrench_world[i];
+  }
+  ext_xfrc_dirty_ = true;
+}
+
+inline void MuJoCoSimulator::ClearExternalForce() noexcept {
+  std::lock_guard lock(pert_mutex_);
+  std::fill(ext_xfrc_.begin(), ext_xfrc_.end(), 0.0);
+  ext_xfrc_dirty_ = false;
+}
+
+inline void MuJoCoSimulator::UpdatePerturb(const mjvPerturb& pert) noexcept {
+  std::lock_guard lock(pert_mutex_);
+  shared_pert_  = pert;
+  pert_active_  = (pert.active != 0);
+}
+
+inline void MuJoCoSimulator::ClearPerturb() noexcept {
+  std::lock_guard lock(pert_mutex_);
+  mjv_defaultPerturb(&shared_pert_);
+  pert_active_ = false;
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────────
@@ -362,18 +453,21 @@ inline void MuJoCoSimulator::ReadState() noexcept {
   for (std::size_t i = 0; i < 6; ++i) {
     latest_positions_[i]  = data_->qpos[joint_qpos_indices_[i]];
     latest_velocities_[i] = data_->qvel[joint_qvel_indices_[i]];
+    // qfrc_actuator: net actuator force on each DOF (Nm for revolute joints).
+    latest_efforts_[i]    = data_->qfrc_actuator[joint_qvel_indices_[i]];
   }
 }
 
 inline void MuJoCoSimulator::InvokeStateCallback() noexcept {
   if (!state_cb_) { return; }
-  std::array<double, 6> pos{}, vel{};
+  std::array<double, 6> pos{}, vel{}, eff{};
   {
     std::lock_guard lock(state_mutex_);
     pos = latest_positions_;
     vel = latest_velocities_;
+    eff = latest_efforts_;
   }
-  state_cb_(pos, vel);
+  state_cb_(pos, vel, eff);
 }
 
 inline void MuJoCoSimulator::UpdateVizBuffer() noexcept {
@@ -388,12 +482,10 @@ inline void MuJoCoSimulator::UpdateVizBuffer() noexcept {
 
 inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
   if (step % 200 != 0) { return; }
-
   const auto   wall_now = std::chrono::steady_clock::now();
   const double wall_dt  =
       std::chrono::duration<double>(wall_now - rtf_wall_start_).count();
   const double sim_dt   = data_->time - rtf_sim_start_;
-
   if (wall_dt > 0.01) {
     rtf_.store(sim_dt / wall_dt, std::memory_order_relaxed);
     rtf_wall_start_ = wall_now;
@@ -401,102 +493,131 @@ inline void MuJoCoSimulator::UpdateRtf(uint64_t step) noexcept {
   }
 }
 
-// ── ThrottleIfNeeded ───────────────────────────────────────────────────────────
-//
-// Reads current_max_rtf_ atomically.  When the value changes, the cumulative
-// window is reset so the new limit takes effect immediately.
-//
 inline void MuJoCoSimulator::ThrottleIfNeeded() noexcept {
   const double max_rtf = current_max_rtf_.load(std::memory_order_relaxed);
-
-  // Reset throttle window when the limit changes.
   if (max_rtf != throttle_rtf_) {
     throttle_wall_start_ = std::chrono::steady_clock::now();
     throttle_sim_start_  = data_->time;
     throttle_rtf_        = max_rtf;
   }
-
   if (max_rtf <= 0.0) { return; }
-
-  const double sim_elapsed  = data_->time - throttle_sim_start_;
-  const double target_wall  = sim_elapsed / max_rtf;
-  const double actual_wall  = std::chrono::duration<double>(
+  const double sim_elapsed = data_->time - throttle_sim_start_;
+  const double target_wall = sim_elapsed / max_rtf;
+  const double actual_wall = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - throttle_wall_start_).count();
-
   if (actual_wall < target_wall) {
     std::this_thread::sleep_for(
         std::chrono::duration<double>(target_wall - actual_wall));
   }
 }
 
+// ── PreparePhysicsStep ─────────────────────────────────────────────────────────
+//
+// Called on the sim thread immediately before mj_step():
+//   1. Apply gravity state (toggle on/off).
+//   2. Apply user-specified external forces (SetExternalForce).
+//   3. Apply mjvPerturb spring force (viewer Ctrl+drag).
+//
+inline void MuJoCoSimulator::PreparePhysicsStep() noexcept {
+  // 1. Gravity toggle (cheap relaxed load)
+  model_->opt.gravity[2] =
+      gravity_enabled_.load(std::memory_order_relaxed)
+      ? static_cast<mjtNum>(original_gravity_z_)
+      : static_cast<mjtNum>(0.0);
+
+  // 2. External forces and perturbation (under pert_mutex_)
+  if (pert_mutex_.try_lock()) {
+    // User-specified wrench via SetExternalForce()
+    if (ext_xfrc_dirty_) {
+      const std::size_t n = static_cast<std::size_t>(model_->nbody) * 6;
+      std::memcpy(data_->xfrc_applied, ext_xfrc_.data(), n * sizeof(double));
+    } else {
+      mju_zero(data_->xfrc_applied, model_->nbody * 6);
+    }
+    // 3. Viewer perturbation spring (additive on top of ext_xfrc_)
+    if (pert_active_ && shared_pert_.select > 0) {
+      mjv_applyPerturbForce(model_, data_, &shared_pert_);
+    }
+    pert_mutex_.unlock();
+  }
+}
+
+inline void MuJoCoSimulator::ClearContactForces() noexcept {
+  // xfrc_applied is re-set each step from the external force buffer.
+  // Clear it here so stale forces don't persist if pert_mutex_ was not acquired.
+  if (!pert_active_ && !ext_xfrc_dirty_) {
+    mju_zero(data_->xfrc_applied, model_->nbody * 6);
+  }
+}
+
 // ── HandleReset ───────────────────────────────────────────────────────────────
-//
-// Reinitialises physics to cfg_.initial_qpos.
-// Must only be called from the sim thread (sole writer of model_/data_).
-//
 inline void MuJoCoSimulator::HandleReset() noexcept {
   mj_resetData(model_, data_);
-
   const int n = std::min(6, model_->nq);
   for (int i = 0; i < n; ++i) {
     const std::size_t ui = static_cast<std::size_t>(i);
     data_->qpos[joint_qpos_indices_[ui]] = cfg_.initial_qpos[ui];
     data_->ctrl[i]                       = cfg_.initial_qpos[ui];
   }
+  // Restore gravity (may have been zeroed before reset)
+  model_->opt.gravity[2] =
+      gravity_enabled_.load(std::memory_order_relaxed)
+      ? static_cast<mjtNum>(original_gravity_z_)
+      : static_cast<mjtNum>(0.0);
   mj_forward(model_, data_);
-
+  {
+    std::lock_guard lock(pert_mutex_);
+    mjv_defaultPerturb(&shared_pert_);
+    pert_active_ = false;
+    std::fill(ext_xfrc_.begin(), ext_xfrc_.end(), 0.0);
+    ext_xfrc_dirty_ = false;
+  }
   step_count_.store(0,   std::memory_order_relaxed);
   sim_time_sec_.store(0.0, std::memory_order_relaxed);
   rtf_.store(0.0, std::memory_order_relaxed);
-
-  const auto now     = std::chrono::steady_clock::now();
-  rtf_wall_start_    = now;  rtf_sim_start_    = data_->time;
-  throttle_wall_start_ = now; throttle_sim_start_ = data_->time;
-  throttle_rtf_      = current_max_rtf_.load(std::memory_order_relaxed);
-
+  const auto now       = std::chrono::steady_clock::now();
+  rtf_wall_start_      = now;  rtf_sim_start_      = data_->time;
+  throttle_wall_start_ = now;  throttle_sim_start_ = data_->time;
+  throttle_rtf_        = current_max_rtf_.load(std::memory_order_relaxed);
   ReadState();
   fprintf(stdout, "[MuJoCoSimulator] Reset to initial pose\n");
 }
 
 // ── SimLoopFreeRun ─────────────────────────────────────────────────────────────
-//
-// Advances physics as fast as possible (throttled by current_max_rtf_).
-// Respects pause_ and reset_requested_ flags from any thread.
-//
 inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
   if (!model_ || !data_) { return; }
 
   const auto decim = static_cast<uint64_t>(
       cfg_.publish_decimation > 0 ? cfg_.publish_decimation : 1);
-
   uint64_t step = 0;
 
   const auto loop_start = std::chrono::steady_clock::now();
-  rtf_wall_start_      = loop_start;  rtf_sim_start_       = data_->time;
-  throttle_wall_start_ = loop_start;  throttle_sim_start_  = data_->time;
+  rtf_wall_start_      = loop_start;  rtf_sim_start_      = data_->time;
+  throttle_wall_start_ = loop_start;  throttle_sim_start_ = data_->time;
   throttle_rtf_        = current_max_rtf_.load(std::memory_order_relaxed);
 
   while (!stop.stop_requested() && running_.load()) {
-    // ── Pause: sleep without advancing physics ─────────────────────────────
+    // ── Pause ─────────────────────────────────────────────────────────────
     if (paused_.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
-
-    // ── Reset: reinitialise to initial pose ────────────────────────────────
+    // ── Reset ─────────────────────────────────────────────────────────────
     if (reset_requested_.exchange(false, std::memory_order_acq_rel)) {
       HandleReset();
       step = 0;
       continue;
     }
-
-    // ── Apply pending command (lock-free fast path) ────────────────────────
+    // ── Command (lock-free fast path) ─────────────────────────────────────
     if (cmd_pending_.load(std::memory_order_acquire)) {
       ApplyCommand();
       cmd_pending_.store(false, std::memory_order_release);
     }
-
+    // ── Physics step ──────────────────────────────────────────────────────
+    PreparePhysicsStep();
     mj_step(model_, data_);
+    ClearContactForces();
+
     ++step;
     step_count_.store(step, std::memory_order_relaxed);
     sim_time_sec_.store(data_->time, std::memory_order_relaxed);
@@ -505,39 +626,28 @@ inline void MuJoCoSimulator::SimLoopFreeRun(std::stop_token stop) noexcept {
       ReadState();
       InvokeStateCallback();
     }
-
     UpdateRtf(step);
     ThrottleIfNeeded();
-
-    if ((step % 8 == 0) && cfg_.enable_viewer) {
-      UpdateVizBuffer();
-    }
+    if ((step % 8 == 0) && cfg_.enable_viewer) { UpdateVizBuffer(); }
   }
 
   fprintf(stdout,
           "[MuJoCoSimulator] FreeRun exited — steps=%lu  sim_time=%.3f s\n",
-          static_cast<unsigned long>(step_count_.load()),
-          sim_time_sec_.load());
+          static_cast<unsigned long>(step_count_.load()), sim_time_sec_.load());
 }
 
 // ── SimLoopSyncStep ────────────────────────────────────────────────────────────
-//
-// 1. Publish current state.
-// 2. Wait for one command (or timeout / resume / reset).
-// 3. Apply command and take one physics step.
-//
 inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
   if (!model_ || !data_) { return; }
 
   const auto timeout = std::chrono::milliseconds(
       static_cast<int64_t>(cfg_.sync_timeout_ms > 0.0 ? cfg_.sync_timeout_ms : 50.0));
-
   uint64_t step = 0;
 
-  const auto loop_start_ss = std::chrono::steady_clock::now();
-  rtf_wall_start_          = loop_start_ss; rtf_sim_start_         = data_->time;
-  throttle_wall_start_     = loop_start_ss; throttle_sim_start_    = data_->time;
-  throttle_rtf_            = current_max_rtf_.load(std::memory_order_relaxed);
+  const auto loop_start = std::chrono::steady_clock::now();
+  rtf_wall_start_      = loop_start;  rtf_sim_start_      = data_->time;
+  throttle_wall_start_ = loop_start;  throttle_sim_start_ = data_->time;
+  throttle_rtf_        = current_max_rtf_.load(std::memory_order_relaxed);
 
   while (!stop.stop_requested() && running_.load()) {
     // ── Pause ─────────────────────────────────────────────────────────────
@@ -545,19 +655,17 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
-
     // ── Reset ─────────────────────────────────────────────────────────────
     if (reset_requested_.exchange(false, std::memory_order_acq_rel)) {
       HandleReset();
       step = 0;
       continue;
     }
-
-    // 1. Publish current state.
+    // 1. Publish current state
     ReadState();
     InvokeStateCallback();
 
-    // 2. Wait for command (or timeout / stop / resume / reset).
+    // 2. Wait for command (or timeout / stop / resume / reset)
     {
       std::unique_lock lock(sync_mutex_);
       sync_cv_.wait_for(lock, timeout, [this, &stop] {
@@ -567,38 +675,33 @@ inline void MuJoCoSimulator::SimLoopSyncStep(std::stop_token stop) noexcept {
             || reset_requested_.load(std::memory_order_relaxed);
       });
     }
-
     if (stop.stop_requested() || !running_.load()) { break; }
-
-    // Handle reset signalled during the wait.
     if (reset_requested_.exchange(false, std::memory_order_acq_rel)) {
       HandleReset();
       step = 0;
       continue;
     }
-
-    // 3. Apply command and step.
+    // 3. Apply command and step
     if (cmd_pending_.load(std::memory_order_acquire)) {
       ApplyCommand();
       cmd_pending_.store(false, std::memory_order_release);
     }
+    PreparePhysicsStep();
     mj_step(model_, data_);
+    ClearContactForces();
+
     ++step;
     step_count_.store(step, std::memory_order_relaxed);
     sim_time_sec_.store(data_->time, std::memory_order_relaxed);
 
     UpdateRtf(step);
     ThrottleIfNeeded();
-
-    if ((step % 8 == 0) && cfg_.enable_viewer) {
-      UpdateVizBuffer();
-    }
+    if ((step % 8 == 0) && cfg_.enable_viewer) { UpdateVizBuffer(); }
   }
 
   fprintf(stdout,
           "[MuJoCoSimulator] SyncStep exited — steps=%lu  sim_time=%.3f s\n",
-          static_cast<unsigned long>(step_count_.load()),
-          sim_time_sec_.load());
+          static_cast<unsigned long>(step_count_.load()), sim_time_sec_.load());
 }
 
 // ── ViewerLoop ─────────────────────────────────────────────────────────────────
@@ -617,15 +720,14 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
   GLFWwindow* window = glfwCreateWindow(
       1280, 960, "UR5e MuJoCo Simulator", nullptr, nullptr);
   if (!window) {
-    fprintf(stderr,
-            "[MuJoCoSimulator] glfwCreateWindow failed — viewer disabled\n");
+    fprintf(stderr, "[MuJoCoSimulator] glfwCreateWindow failed\n");
     glfwTerminate();
     return;
   }
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
 
-  // ── MuJoCo rendering objects ──────────────────────────────────────────────
+  // ── MuJoCo rendering ──────────────────────────────────────────────────────
   mjvCamera  cam;  mjv_defaultCamera(&cam);
   mjvOption  opt;  mjv_defaultOption(&opt);
   mjvScene   scn;  mjv_defaultScene(&scn);
@@ -639,46 +741,56 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
   cam.azimuth   = 90.0;
   cam.elevation = -20.0;
 
+  // ── Visualization-only mjData ─────────────────────────────────────────────
+  mjData* vis_data = mj_makeData(model_);
+  {
+    std::lock_guard lock(state_mutex_);
+    for (std::size_t i = 0; i < 6; ++i) {
+      vis_data->qpos[joint_qpos_indices_[i]] = latest_positions_[i];
+    }
+  }
+  mj_forward(model_, vis_data);
+
   // ── RTF profiler figure ───────────────────────────────────────────────────
   mjvFigure fig_profiler;
   mjv_defaultFigure(&fig_profiler);
   std::strncpy(fig_profiler.title,       "RTF History",
                sizeof(fig_profiler.title) - 1);
-  std::strncpy(fig_profiler.xlabel,      "Frames",
+  std::strncpy(fig_profiler.xlabel,      "Frames (~60 Hz)",
                sizeof(fig_profiler.xlabel) - 1);
   std::strncpy(fig_profiler.linename[0], "RTF",
                sizeof(fig_profiler.linename[0]) - 1);
-  // Semi-transparent dark background
-  fig_profiler.figurergba[0] = 0.1f;
-  fig_profiler.figurergba[1] = 0.1f;
-  fig_profiler.figurergba[2] = 0.1f;
-  fig_profiler.figurergba[3] = 0.85f;
-  // Green line
+  fig_profiler.figurergba[0] = 0.08f;
+  fig_profiler.figurergba[1] = 0.08f;
+  fig_profiler.figurergba[2] = 0.08f;
+  fig_profiler.figurergba[3] = 0.88f;
   fig_profiler.linergb[0][0] = 0.2f;
   fig_profiler.linergb[0][1] = 1.0f;
   fig_profiler.linergb[0][2] = 0.4f;
   fig_profiler.linewidth     = 1.5f;
-  // Y-axis: 0–30× RTF; X-axis: 0–200 frames
-  fig_profiler.range[0][0] = 0;  fig_profiler.range[0][1] = 200;
-  fig_profiler.range[1][0] = 0;  fig_profiler.range[1][1] = 30;
-  fig_profiler.flg_extend  = 1;  // auto-extend Y if RTF exceeds 30
+  fig_profiler.range[0][0]   = 0;    fig_profiler.range[0][1] = 200;
+  fig_profiler.range[1][0]   = 0;    fig_profiler.range[1][1] = 30;
+  fig_profiler.flg_extend    = 1;
 
-  // Viewer interaction state — shared with GLFW callbacks via window user pointer.
-  // Defined as a local struct so that captureless lambdas can reach it through
-  // glfwGetWindowUserPointer().
+  // ── Viewer interaction state (shared with GLFW callbacks via user ptr) ────
   struct ViewerState {
-    // MuJoCo rendering handles (non-owning)
+    // MuJoCo handles (non-owning pointers, all local to ViewerLoop)
     mjvCamera*       cam;
     mjvOption*       opt;
     mjvScene*        scn;
     const mjModel*   model;
+    mjData*          vis_data;
     MuJoCoSimulator* sim;
 
     // Mouse tracking
     bool   btn_left{false};
     bool   btn_right{false};
+    bool   ctrl_held{false};
     double lastx{0.0};
     double lasty{0.0};
+
+    // Perturbation state (local to viewer, transferred to sim via UpdatePerturb)
+    mjvPerturb pert;
 
     // UI toggles
     bool show_profiler{false};
@@ -687,21 +799,18 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
     static constexpr int kProfLen = 200;
     float rtf_history[kProfLen]{};
     int   rtf_head{0};
-    int   rtf_count{0};  // samples pushed so far, capped at kProfLen
+    int   rtf_count{0};
 
     void push_rtf(float v) noexcept {
       rtf_history[rtf_head] = v;
-      rtf_head = (rtf_head + 1) % kProfLen;
+      rtf_head  = (rtf_head + 1) % kProfLen;
       if (rtf_count < kProfLen) { ++rtf_count; }
     }
 
-    // Fill mjvFigure line 0 from the rolling buffer (oldest → newest).
     void update_figure(mjvFigure& fig) const noexcept {
-      const int n = rtf_count;
+      const int n      = rtf_count;
       if (n == 0) { return; }
-      // oldest entry is at (rtf_head - n + kProfLen) % kProfLen when full
-      const int oldest = (rtf_count < kProfLen) ? 0
-                       : (rtf_head);
+      const int oldest = (rtf_count < kProfLen) ? 0 : rtf_head;
       for (int i = 0; i < n; ++i) {
         const int idx = (oldest + i) % kProfLen;
         fig.linedata[0][i * 2]     = static_cast<float>(i);
@@ -709,39 +818,47 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
       }
       fig.linepnt[0] = n;
     }
-  } vs{&cam, &opt, &scn, model_, this};
+  } vs{&cam, &opt, &scn, model_, vis_data, this};
+  mjv_defaultPerturb(&vs.pert);
 
   glfwSetWindowUserPointer(window, &vs);
 
-  // ── GLFW callbacks ────────────────────────────────────────────────────────
-  //
-  // All callbacks are captureless lambdas → implicit function pointer
-  // conversion is valid.  State is retrieved via glfwGetWindowUserPointer().
+  // ── GLFW callbacks (captureless lambdas → implicit function pointers) ─────
 
-  // Keyboard: Space=pause, +/-=speed, R=reset, F3=profiler,
-  //           Backspace=reset opt, Escape=reset camera
+  // Keyboard
   glfwSetKeyCallback(window,
     [](GLFWwindow* w, int key, int /*scan*/, int action, int /*mods*/) noexcept {
-      if (action == GLFW_RELEASE) { return; }
       auto* s = static_cast<ViewerState*>(glfwGetWindowUserPointer(w));
       if (!s) { return; }
+
+      // Track Ctrl key — needs both PRESS and RELEASE.
+      if (key == GLFW_KEY_LEFT_CONTROL || key == GLFW_KEY_RIGHT_CONTROL) {
+        s->ctrl_held = (action != GLFW_RELEASE);
+        if (!s->ctrl_held && s->pert.active) {
+          s->pert.active = 0;
+          s->sim->ClearPerturb();
+        }
+        return;
+      }
+
+      if (action == GLFW_RELEASE) { return; }
+
       switch (key) {
+        // ── Simulation controls ──────────────────────────────────────────
         case GLFW_KEY_SPACE:
           if (s->sim->IsPaused()) { s->sim->Resume(); }
           else                    { s->sim->Pause();  }
           break;
 
-        case GLFW_KEY_EQUAL:       // '=' (same physical key as '+' unshifted)
+        case GLFW_KEY_EQUAL:
         case GLFW_KEY_KP_ADD: {
           const double cur = s->sim->GetMaxRtf();
           s->sim->SetMaxRtf(cur <= 0.0 ? 2.0 : cur * 2.0);
           break;
         }
-
         case GLFW_KEY_MINUS:
         case GLFW_KEY_KP_SUBTRACT: {
           const double cur = s->sim->GetMaxRtf();
-          // Below 0.5× → revert to unlimited
           if (cur > 0.0 && cur <= 0.5) { s->sim->SetMaxRtf(0.0); }
           else if (cur > 0.5)          { s->sim->SetMaxRtf(cur / 2.0); }
           break;
@@ -751,6 +868,35 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
           s->sim->RequestReset();
           break;
 
+        // ── Physics toggles ───────────────────────────────────────────────
+        case GLFW_KEY_G:
+          s->sim->EnableGravity(!s->sim->IsGravityEnabled());
+          fprintf(stdout, "[Viewer] Gravity %s\n",
+                  s->sim->IsGravityEnabled() ? "ON" : "OFF");
+          break;
+
+        // ── Visualisation toggles ─────────────────────────────────────────
+        case GLFW_KEY_C:
+          // Contact point markers
+          s->opt->flags[mjVIS_CONTACTPOINT] ^= 1;
+          break;
+
+        case GLFW_KEY_F:
+          // Contact force arrows
+          s->opt->flags[mjVIS_CONTACTFORCE] ^= 1;
+          break;
+
+        case GLFW_KEY_V:
+          // Toggle collision geometry group 0
+          s->opt->geomgroup[0] ^= 1;
+          break;
+
+        case GLFW_KEY_T:
+          // Transparency for all bodies
+          s->opt->flags[mjVIS_TRANSPARENT] ^= 1;
+          break;
+
+        // ── Viewer controls ───────────────────────────────────────────────
         case GLFW_KEY_F3:
           s->show_profiler = !s->show_profiler;
           break;
@@ -770,55 +916,87 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
       }
     });
 
-  // Mouse button: track which buttons are pressed + cursor anchor
+  // Mouse buttons — orbit/pan or perturbation selection (Ctrl held)
   glfwSetMouseButtonCallback(window,
     [](GLFWwindow* w, int button, int action, int /*mods*/) noexcept {
       auto* s = static_cast<ViewerState*>(glfwGetWindowUserPointer(w));
       if (!s) { return; }
       const bool pressed = (action == GLFW_PRESS);
-      if (button == GLFW_MOUSE_BUTTON_LEFT)  { s->btn_left  = pressed; }
-      if (button == GLFW_MOUSE_BUTTON_RIGHT) { s->btn_right = pressed; }
-      // Anchor the drag start position on press
-      if (pressed) {
-        glfwGetCursorPos(w, &s->lastx, &s->lasty);
+
+      if (s->ctrl_held && pressed && button == GLFW_MOUSE_BUTTON_LEFT) {
+        // ── Ctrl+Left: body selection for perturbation ───────────────────
+        double xp = 0.0, yp = 0.0;
+        glfwGetCursorPos(w, &xp, &yp);
+        int width = 0, height = 0;
+        glfwGetWindowSize(w, &width, &height);
+        if (width > 0 && height > 0) {
+          mjtNum selpnt[3] = {};
+          int selgeom = -1, selskin = -1;
+          const int selobj = mjv_select(
+              s->model, s->vis_data, s->opt,
+              static_cast<mjtNum>(width) / static_cast<mjtNum>(height),
+              static_cast<mjtNum>(xp)   / static_cast<mjtNum>(width),
+              static_cast<mjtNum>(height - yp) / static_cast<mjtNum>(height),
+              s->scn, selpnt, &selgeom, &selskin);
+
+          if (selobj > 0) {  // > 0: a UR5e link (0 = world body)
+            s->pert.select = selobj;
+            mju_copy(s->pert.localpos, selpnt, 3);
+            mjv_initPerturb(s->model, s->vis_data, s->scn, &s->pert);
+            s->pert.active = mjPERT_TRANSLATE;
+            s->sim->UpdatePerturb(s->pert);
+            fprintf(stdout, "[Viewer] Perturbing body %d\n", selobj);
+          }
+        }
+      } else if (!pressed && button == GLFW_MOUSE_BUTTON_LEFT && s->pert.active) {
+        // ── Release left button: clear perturbation ───────────────────────
+        s->pert.active = 0;
+        s->sim->ClearPerturb();
       }
+
+      if (!s->ctrl_held) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT)  { s->btn_left  = pressed; }
+        if (button == GLFW_MOUSE_BUTTON_RIGHT) { s->btn_right = pressed; }
+      }
+      if (pressed) { glfwGetCursorPos(w, &s->lastx, &s->lasty); }
     });
 
-  // Cursor movement: orbit (left drag) or pan (right drag)
+  // Cursor move — camera orbit/pan, or perturbation drag (Ctrl)
   glfwSetCursorPosCallback(window,
     [](GLFWwindow* w, double xpos, double ypos) noexcept {
       auto* s = static_cast<ViewerState*>(glfwGetWindowUserPointer(w));
-      if (!s || (!s->btn_left && !s->btn_right)) {
-        // No button held — just update position
-        s->lastx = xpos;
-        s->lasty = ypos;
-        return;
-      }
+      if (!s) { return; }
 
       int width = 0, height = 0;
       glfwGetWindowSize(w, &width, &height);
-      if (width == 0 || height == 0) { return; }
+      if (width == 0 || height == 0) { s->lastx = xpos; s->lasty = ypos; return; }
 
       const double dx = xpos - s->lastx;
       const double dy = ypos - s->lasty;
       s->lastx = xpos;
       s->lasty = ypos;
-
       const double nx = dx / static_cast<double>(width);
       const double ny = dy / static_cast<double>(height);
 
-      if (s->btn_left) {
-        // Left drag → orbit (separate H and V passes for smooth rotation)
+      if (s->ctrl_held && s->pert.active) {
+        // ── Ctrl+drag: move perturbation reference point ──────────────────
+        mjv_movePerturb(s->model, s->vis_data,
+                        mjMOUSE_MOVE_H, nx, 0.0, s->scn, &s->pert);
+        mjv_movePerturb(s->model, s->vis_data,
+                        mjMOUSE_MOVE_V, 0.0, ny, s->scn, &s->pert);
+        s->sim->UpdatePerturb(s->pert);
+      } else if (s->btn_left) {
+        // ── Left drag: orbit ───────────────────────────────────────────────
         mjv_moveCamera(s->model, mjMOUSE_ROTATE_H, nx, 0.0, s->scn, s->cam);
         mjv_moveCamera(s->model, mjMOUSE_ROTATE_V, 0.0, ny, s->scn, s->cam);
       } else if (s->btn_right) {
-        // Right drag → pan (translate camera target)
+        // ── Right drag: pan ────────────────────────────────────────────────
         mjv_moveCamera(s->model, mjMOUSE_MOVE_H, nx, 0.0, s->scn, s->cam);
         mjv_moveCamera(s->model, mjMOUSE_MOVE_V, 0.0, ny, s->scn, s->cam);
       }
     });
 
-  // Scroll: zoom
+  // Scroll — zoom
   glfwSetScrollCallback(window,
     [](GLFWwindow* w, double /*xoffset*/, double yoffset) noexcept {
       auto* s = static_cast<ViewerState*>(glfwGetWindowUserPointer(w));
@@ -827,26 +1005,19 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
                      -0.05 * yoffset, s->scn, s->cam);
     });
 
-  // Visualization-only mjData — never written by the sim thread.
-  mjData* vis_data = mj_makeData(model_);
-  {
-    std::lock_guard lock(state_mutex_);
-    for (std::size_t i = 0; i < 6; ++i) {
-      vis_data->qpos[joint_qpos_indices_[i]] = latest_positions_[i];
-    }
-  }
-  mj_forward(model_, vis_data);
-
   fprintf(stdout,
-          "[MuJoCoSimulator] Viewer running\n"
-          "  Space:pause  +/-:speed  R:reset  F3:profiler  Esc:camera\n"
-          "  Left-drag:orbit  Right-drag:pan  Scroll:zoom\n");
+          "[MuJoCoSimulator] Viewer ready\n"
+          "  Keyboard: Space=pause  +/-=speed  R=reset  G=gravity"
+          "  C=contacts  F=forces  V=geoms  T=transparent  F3=profiler"
+          "  Esc=camera\n"
+          "  Mouse: Left-drag=orbit  Right-drag=pan  Scroll=zoom"
+          "  Ctrl+Left-drag=perturb body\n");
 
   // ── Render loop ────────────────────────────────────────────────────────────
   while (!stop.stop_requested() && running_.load() &&
          !glfwWindowShouldClose(window)) {
 
-    // ── Sync viz buffer from sim thread ─────────────────────────────────────
+    // Sync physics state to vis_data
     int ncon_snap = 0;
     {
       std::lock_guard lock(viz_mutex_);
@@ -859,24 +1030,26 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
     }
     mj_forward(model_, vis_data);
 
-    // ── Sample RTF into rolling buffer (60 Hz) ───────────────────────────────
+    // Sample RTF into rolling buffer
     const float cur_rtf = static_cast<float>(rtf_.load(std::memory_order_relaxed));
     vs.push_rtf(cur_rtf);
     vs.update_figure(fig_profiler);
 
-    // ── Render scene ──────────────────────────────────────────────────────────
+    // ── Render ───────────────────────────────────────────────────────────────
     int width = 0, height = 0;
     glfwGetFramebufferSize(window, &width, &height);
     mjrRect viewport{0, 0, width, height};
 
-    mjv_updateScene(model_, vis_data, &opt, nullptr, &cam, mjCAT_ALL, &scn);
+    // Pass &vs.pert so MuJoCo renders the perturbation grab indicator
+    mjv_updateScene(model_, vis_data, &opt, &vs.pert, &cam, mjCAT_ALL, &scn);
     mjr_render(viewport, &scn, &con);
 
     // ── Status overlay (top-right) ────────────────────────────────────────────
     {
-      const double   max_rtf_val = current_max_rtf_.load(std::memory_order_relaxed);
-      const bool     is_paused   = paused_.load(std::memory_order_relaxed);
-      const SimMode  mode        = cfg_.mode;
+      const double max_rtf_val = current_max_rtf_.load(std::memory_order_relaxed);
+      const bool   is_paused   = paused_.load(std::memory_order_relaxed);
+      const bool   grav_on     = gravity_enabled_.load(std::memory_order_relaxed);
+      const bool   perturbing  = (vs.pert.active != 0);
 
       char limit_str[32];
       if (max_rtf_val > 0.0) {
@@ -888,37 +1061,38 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
       char labels[256], values[256];
       std::snprintf(labels, sizeof(labels),
-                    "Mode\nRTF\nLimit\nSim Time\nSteps\nContacts\nStatus");
+                    "Mode\nRTF\nLimit\nSim Time\nSteps\nContacts\nGravity\nStatus");
       std::snprintf(values, sizeof(values),
-                    "%s\n%.1fx\n%s\n%.2f s\n%lu\n%d\n%s",
-                    mode == SimMode::kFreeRun ? "free_run" : "sync_step",
+                    "%s\n%.1fx\n%s\n%.2f s\n%lu\n%d\n%s\n%s",
+                    cfg_.mode == SimMode::kFreeRun ? "free_run" : "sync_step",
                     static_cast<double>(cur_rtf),
                     limit_str,
                     sim_time_sec_.load(std::memory_order_relaxed),
-                    static_cast<unsigned long>(step_count_.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long>(step_count_.load()),
                     ncon_snap,
-                    is_paused ? "PAUSED" : "running");
+                    grav_on   ? "ON"       : "OFF",
+                    is_paused ? "PAUSED"   : (perturbing ? "perturb" : "running"));
       mjr_overlay(mjFONT_NORMAL, mjGRID_TOPRIGHT, viewport,
                   labels, values, &con);
     }
 
     // ── Help overlay (bottom-left) ────────────────────────────────────────────
     mjr_overlay(mjFONT_NORMAL, mjGRID_BOTTOMLEFT, viewport,
-                "Space:pause  +/-:speed  R:reset  F3:profiler\n"
-                "Left-drag:orbit  Right-drag:pan  Scroll:zoom  Esc:camera",
+                "Space:pause  +/-:speed  R:reset  G:gravity  C:contacts"
+                "  F:forces  V:geoms  T:transp  F3:profiler  Esc:camera\n"
+                "Left-drag:orbit  Right-drag:pan  Scroll:zoom"
+                "  Ctrl+Left-drag:perturb",
                 nullptr, &con);
 
-    // ── Profiler figure (bottom-right, toggled by F3) ─────────────────────────
+    // ── Profiler (bottom-right, F3) ───────────────────────────────────────────
     if (vs.show_profiler && vs.rtf_count > 0) {
       const int fw = width  / 3;
       const int fh = height / 3;
-      mjrRect fig_rect{width - fw, 0, fw, fh};
-      mjr_figure(fig_rect, &fig_profiler, &con);
+      mjr_figure(mjrRect{width - fw, 0, fw, fh}, &fig_profiler, &con);
     }
 
     glfwSwapBuffers(window);
     glfwPollEvents();
-
     std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60 Hz
   }
 
@@ -931,8 +1105,7 @@ inline void MuJoCoSimulator::ViewerLoop(std::stop_token stop) noexcept {
 
 #else
   fprintf(stdout,
-          "[MuJoCoSimulator] Viewer not available "
-          "(build without -DMUJOCO_HAVE_GLFW)\n");
+          "[MuJoCoSimulator] Viewer not available (MUJOCO_HAVE_GLFW not set)\n");
   (void)stop;
 #endif
 }

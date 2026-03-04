@@ -59,8 +59,9 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
     // Wire state callback: called from sim thread at control_freq Hz
     sim_->SetStateCallback(
         [this](const std::array<double, 6>& pos,
-               const std::array<double, 6>& vel) {
-          PublishJointState(pos, vel);
+               const std::array<double, 6>& vel,
+               const std::array<double, 6>& eff) {
+          PublishJointState(pos, vel, eff);
         });
 
     sim_->Start();
@@ -235,14 +236,14 @@ class MuJoCoSimulatorNode : public rclcpp::Node {
   // Called from SimLoop thread at control_freq Hz.
   // rclcpp::Publisher::publish() is thread-safe in ROS2 Humble.
   void PublishJointState(const std::array<double, 6>& positions,
-                         const std::array<double, 6>& velocities) {
+                         const std::array<double, 6>& velocities,
+                         const std::array<double, 6>& efforts) {
     auto msg = sensor_msgs::msg::JointState();
     msg.header.stamp = now();
     msg.name         = {kJointNames.begin(), kJointNames.end()};
     msg.position     = {positions.begin(),   positions.end()};
     msg.velocity     = {velocities.begin(),  velocities.end()};
-    // Effort not simulated; fill with zeros
-    msg.effort.assign(6, 0.0);
+    msg.effort       = {efforts.begin(),     efforts.end()};
     joint_state_pub_->publish(msg);
   }
 
