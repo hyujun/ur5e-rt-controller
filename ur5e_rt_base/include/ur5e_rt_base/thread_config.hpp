@@ -2,7 +2,6 @@
 #define UR5E_RT_BASE_THREAD_CONFIG_HPP_
 
 #include <sched.h>  // SCHED_FIFO, SCHED_OTHER, SCHED_RR
-#include <string>
 
 namespace ur5e_rt_controller {
 
@@ -12,7 +11,7 @@ struct ThreadConfig {
   int         sched_policy;     // SCHED_FIFO, SCHED_RR, or SCHED_OTHER
   int         sched_priority;   // 1-99 for SCHED_FIFO/RR, ignored for OTHER
   int         nice_value;       // -20 to 19 for SCHED_OTHER, ignored for FIFO/RR
-  std::string name;             // Thread name for debugging (max 15 chars)
+  const char* name;             // Thread name for debugging (max 15 chars)
 };
 
 // ── 6-core configuration ────────────────────────────────────────────────────

@@ -454,10 +454,10 @@ int main(int argc, char** argv) {
     return std::thread([&executor, cfg]() {
       if (!urtc::ApplyThreadConfig(cfg)) {
         fprintf(stderr, "[WARN] Thread config failed for '%s' (need realtime permissions)\n",
-                cfg.name.c_str());
+                cfg.name);
       } else {
         fprintf(stdout, "[INFO] Thread '%s' configured:\n%s",
-                cfg.name.c_str(),
+                cfg.name,
                 urtc::VerifyThreadConfig().c_str());
       }
       executor.spin();
