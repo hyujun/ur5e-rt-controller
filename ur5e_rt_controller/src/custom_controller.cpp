@@ -51,7 +51,6 @@
 #include "ur5e_rt_base/thread_utils.hpp"
 
 #include <rclcpp/rclcpp.hpp>
-#include <realtime_tools/realtime_publisher.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
@@ -176,14 +175,11 @@ class CustomController : public rclcpp::Node {
   }
 
   void CreatePublishers() {
-    // Fix 5: RealtimePublisher avoids heap allocation / DDS lock on the RT path.
-    // The message buffer is pre-allocated once here so ControlLoop() only does
-    // a std::copy + trylock — both O(1) and lock-free on the fast path.
-    auto raw_pub = create_publisher<std_msgs::msg::Float64MultiArray>(
+    // Pre-allocate the command message once. ControlLoop() uses try_lock() to
+    // avoid blocking on the RT path — same semantics as RealtimePublisher.
+    cmd_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
         "/forward_position_controller/commands", 10);
-    rt_command_pub_ = std::make_unique<
-        realtime_tools::RealtimePublisher<std_msgs::msg::Float64MultiArray>>(raw_pub);
-    rt_command_pub_->msg_.data.resize(urtc::kNumRobotJoints, 0.0);
+    cmd_msg_.data.resize(urtc::kNumRobotJoints, 0.0);
 
     estop_pub_ = create_publisher<std_msgs::msg::Bool>("/system/estop_status", 10);
   }
@@ -324,12 +320,12 @@ class CustomController : public rclcpp::Node {
     const urtc::ControllerOutput output =
         timing_profiler_.MeasuredCompute(*controller_, state);
 
-    // Fix 5: trylock is non-blocking; if the DDS layer still holds the message
-    // we simply skip publishing this cycle (jitter < 2 ms is acceptable).
-    if (rt_command_pub_->trylock()) {
+    // Non-blocking: skip this cycle if publisher mutex is contended.
+    if (cmd_pub_mutex_.try_lock()) {
       std::copy(output.robot_commands.begin(), output.robot_commands.end(),
-                rt_command_pub_->msg_.data.begin());
-      rt_command_pub_->unlockAndPublish();
+                cmd_msg_.data.begin());
+      cmd_pub_->publish(cmd_msg_);
+      cmd_pub_mutex_.unlock();
     }
 
     // Fix 1: push log entry to the SPSC ring buffer — O(1), no syscall.
@@ -376,10 +372,9 @@ class CustomController : public rclcpp::Node {
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr  target_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr  hand_state_sub_;
 
-  // Fix 5: RealtimePublisher with pre-allocated message — no heap allocation
-  // on the RT path. trylock()/unlockAndPublish() are lock-free on the fast path.
-  std::unique_ptr<realtime_tools::RealtimePublisher<
-      std_msgs::msg::Float64MultiArray>>                             rt_command_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr     cmd_pub_;
+  std_msgs::msg::Float64MultiArray                                   cmd_msg_;
+  std::mutex                                                         cmd_pub_mutex_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                  estop_pub_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
