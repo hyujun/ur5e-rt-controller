@@ -86,6 +86,7 @@ jobs:
     - name: Upload Coverage to CodeCov
       uses: codecov/codecov-action@v4
       with:
+        token: ${{ secrets.CODECOV_TOKEN }}
         files: ./build/ur5e_rt_controller/coverage_filtered.info
         flags: unittests
         name: ur5e-rt-controller
