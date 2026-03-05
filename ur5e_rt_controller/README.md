@@ -38,9 +38,12 @@ ur5e_rt_controller/
 CustomController (ROS2 노드)
     │
     ├── rt_executor (Core 2, FIFO/90)     ← ControlLoop() 500Hz, CheckTimeouts() 50Hz
-    ├── sensor_executor (Core 3, FIFO/70) ← /joint_states, /target_joint_positions, /hand/joint_states
+    ├── sensor_executor (Core 3, FIFO/70) ← /joint_states, /target_joint_positions, /hand/joint_states [전용]
     ├── log_executor (Core 4, OTHER/nice-5)← DataLogger CSV 기록 (SpscLogBuffer 드레인)
     └── aux_executor (Core 5, OTHER/0)    ← /system/estop_status 퍼블리시
+
+HandUdpReceiver (별도 jthread)
+    └── udp_recv (Core 5, FIFO/65)       ← UDP 패킷 수신 [sensor_io와 분리, v5.1.0]
 
     controller_ (RTControllerInterface)
         └── [교체 가능] PDController / PinocchioController / ClikController / OSController
@@ -181,6 +184,11 @@ ros2 launch ur5e_rt_controller ur_control.launch.py use_fake_hardware:=true
 |----------|--------|------|
 | `robot_ip` | `192.168.1.10` | UR 로봇 IP |
 | `use_fake_hardware` | `false` | 가상 하드웨어 모드 |
+| `use_cpu_affinity` | `true` | UR 드라이버 Core 0-1 taskset 자동 적용 (3초 후) |
+
+런치 파일이 자동 설정하는 환경변수:
+- `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+- `CYCLONEDDS_URI` → `config/cyclone_dds.xml` (DDS recv/send 스레드 Core 0-1 제한)
 
 ---
 
