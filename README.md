@@ -1,5 +1,9 @@
 # UR5e RT Controller
 
+![CI](https://github.com/hyujun/ur5e-rt-controller/actions/workflows/ros2-advanced-ci.yml/badge.svg)
+[![codecov](https://codecov.io/gh/hyujun/ur5e-rt-controller/branch/master/graph/badge.svg)](https://codecov.io/gh/hyujun/ur5e-rt-controller)
+![ROS2 Humble](https://img.shields.io/badge/ROS2-Humble-blue)
+
 **Ubuntu 22.04 + ROS2 Humble | 실시간 UR5e 제어기 + 커스텀 핸드 통합 (v5.2.0)**
 
 E-STOP 안전 시스템, PD 제어기, **Pinocchio 기반 모델 제어기 3종**, **MuJoCo 3.x 물리 시뮬레이터**, UDP 핸드 인터페이스, CSV 데이터 로깅, Qt GUI 모션 에디터를 포함한 완전한 실시간 제어 솔루션입니다.
