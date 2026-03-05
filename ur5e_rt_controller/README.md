@@ -7,20 +7,23 @@ UR5e 로봇 팔을 위한 **500Hz 실시간 위치 제어기** ROS2 패키지입
 ```
 ur5e_rt_controller/
 ├── include/ur5e_rt_controller/
-│   ├── rt_controller_interface.hpp        ← 추상 기반 클래스
+│   ├── rt_controller_interface.hpp        ← 추상 기반 클래스 (Strategy Pattern)
 │   ├── controller_timing_profiler.hpp     ← 잠금-없는 Compute() 타이밍 프로파일러
 │   └── controllers/
-│       ├── pd_controller.hpp              ← PD + E-STOP (기본 구현)
-│       ├── p_controller.hpp               ← 단순 P 제어기
+│       ├── pd_controller.hpp              ← PD + E-STOP (기본값)
+│       ├── p_controller.hpp               ← 단순 P 제어기 (개발/테스트용)
 │       ├── pinocchio_controller.hpp       ← 모델 기반 PD + 중력/코리올리 보상
 │       ├── clik_controller.hpp            ← 폐루프 IK (데카르트 3-DOF)
-│       └── operational_space_controller.hpp ← 전체 6-DOF 데카르트 PD
+│       └── operational_space_controller.hpp ← 전체 6-DOF 데카르트 PD + SO(3)
 ├── src/
-│   └── custom_controller.cpp              ← 메인 500Hz 노드
+│   └── custom_controller.cpp              ← 메인 500Hz 노드 (4 executor, 4 thread)
 ├── config/
-│   └── ur5e_rt_controller.yaml           ← 제어기 파라미터
+│   ├── ur5e_rt_controller.yaml           ← 제어기 파라미터
+│   └── cyclone_dds.xml                   ← CycloneDDS 스레드 Core 0-1 제한
+├── scripts/
+│   └── setup_irq_affinity.sh             ← NIC IRQ → Core 0-1 고정 스크립트
 └── launch/
-    └── ur_control.launch.py               ← 전체 시스템 실행
+    └── ur_control.launch.py               ← 전체 시스템 (use_cpu_affinity 포함)
 ```
 
 **의존성:**

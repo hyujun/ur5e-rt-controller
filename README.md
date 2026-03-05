@@ -183,12 +183,25 @@ ur5e_tools         ← 독립 (Python 전용, rclpy)
 
 ```cpp
 namespace ur5e_rt_controller {
-  struct RobotState { Eigen::VectorXd q{6}, qd{6}; Eigen::Vector3d tcp_pos; };
-  struct HandState  { Eigen::VectorXd motor_pos{11}, motor_vel{11}, motor_current{11}, sensor_data{44}; };
-  struct ControllerOutput { Eigen::VectorXd robot_cmd{6}, hand_cmd{11}; };
+  struct RobotState {
+    std::array<double, 6>  positions{}, velocities{};
+    std::array<double, 3>  tcp_position{};
+    double dt{0.002}; uint64_t iteration{0};
+  };
+  struct HandState {
+    std::array<double, 11> motor_positions{}, motor_velocities{}, motor_currents{};
+    std::array<double, 44> sensor_data{};
+    bool valid{false};
+  };
+  struct ControllerOutput {
+    std::array<double, 6>  robot_commands{};
+    std::array<double, 11> hand_commands{};
+    bool valid{true};
+  };
 
   class RTControllerInterface {
-    virtual ControllerOutput compute(const ControllerState& state) noexcept = 0;
+    [[nodiscard]] virtual ControllerOutput Compute(
+        const ControllerState& state) noexcept = 0;
   };
 }
 ```
@@ -196,12 +209,12 @@ namespace ur5e_rt_controller {
 #### `PDController` (`include/ur5e_rt_controller/controllers/pd_controller.hpp`)
 비례-미분 제어기. E-STOP 발생 시 안전 위치 `[0, -1.57, 1.57, -1.57, -1.57, 0]`로 이동.
 
-#### `DataLogger` (`include/ur5e_rt_controller/data_logger.hpp`)
-이동 불가 복사 비허용 CSV 로거. 타임스탬프, 현재/목표 위치, 명령값 기록.
-`DrainBuffer(ControlLogBuffer&)` 메서드로 SPSC 링 버퍼를 소진하여 파일에 씀 — 파일 I/O는 log 스레드(Core 4)에서만 발생.
+#### `DataLogger` (`ur5e_rt_base/include/ur5e_rt_base/data_logger.hpp`)
+이동 전용(복사 불가) 비-RT CSV 로거. 타임스탬프, 현재/목표 위치, 명령값, `compute_time_us` 기록.
+`DrainAndWrite(SpscLogBuffer<LogEntry, 512>&)` 메서드로 SPSC 링 버퍼를 소진하여 파일에 씀 — 파일 I/O는 log 스레드(Core 4)에서만 발생.
 
-#### `ControlLogBuffer` (`include/ur5e_rt_controller/log_buffer.hpp`)
-`SpscLogBuffer<512>` 기반 lock-free 단일 생산자/단일 소비자 링 버퍼.
+#### `SpscLogBuffer` (`ur5e_rt_base/include/ur5e_rt_base/log_buffer.hpp`)
+`SpscLogBuffer<LogEntry, 512>` lock-free 단일 생산자/단일 소비자 링 버퍼.
 RT 스레드(생산자)가 `Push()`로 `LogEntry`를 넣으면, log 스레드(소비자)가 `Pop()`으로 꺼내 파일에 씀. 버퍼가 가득 차면 해당 엔트리를 드롭(RT 지터 없음).
 
 ---
@@ -224,16 +237,16 @@ v4.4.0+에서 MuJoCo 3.x 물리 엔진을 사용하는 시뮬레이터가 추가
 ./install.sh sim
 
 # Free-run 시뮬레이션 (뷰어 창 자동 오픈)
-ros2 launch ur5e_rt_controller mujoco_sim.launch.py
+ros2 launch ur5e_mujoco_sim mujoco_sim.launch.py
 
 # Sync-step 모드
-ros2 launch ur5e_rt_controller mujoco_sim.launch.py sim_mode:=sync_step
+ros2 launch ur5e_mujoco_sim mujoco_sim.launch.py sim_mode:=sync_step
 
 # 헤드리스 (뷰어 없음, 서버 환경)
-ros2 launch ur5e_rt_controller mujoco_sim.launch.py enable_viewer:=false
+ros2 launch ur5e_mujoco_sim mujoco_sim.launch.py enable_viewer:=false
 
 # 외부 MJCF 모델 사용 (MuJoCo Menagerie 등)
-ros2 launch ur5e_rt_controller mujoco_sim.launch.py \
+ros2 launch ur5e_mujoco_sim mujoco_sim.launch.py \
     model_path:=/path/to/mujoco_menagerie/universal_robots_ur5e/scene.xml
 
 # 시뮬레이션 상태 확인
@@ -550,7 +563,7 @@ ros2 launch ur5e_rt_controller ur_control.launch.py use_fake_hardware:=true use_
 ### UDP 핸드 노드만 실행
 
 ```bash
-ros2 launch ur5e_rt_controller hand_udp.launch.py \
+ros2 launch ur5e_hand_udp hand_udp.launch.py \
     udp_port:=50001 \
     target_ip:=192.168.1.100 \
     target_port:=50002
@@ -563,7 +576,7 @@ ros2 launch ur5e_rt_controller hand_udp.launch.py \
 sudo apt install python3-pyqt5
 
 # GUI 실행
-ros2 run ur5e_rt_controller motion_editor_gui.py
+ros2 run ur5e_tools motion_editor_gui.py
 ```
 
 GUI 사용법:
@@ -578,23 +591,23 @@ GUI 사용법:
 
 ```bash
 # 모든 관절 플롯
-ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv
+ros2 run ur5e_tools plot_ur_trajectory.py /tmp/ur5e_control_log.csv
 
 # 특정 관절만 (0~5)
-ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --joint 2
+ros2 run ur5e_tools plot_ur_trajectory.py /tmp/ur5e_control_log.csv --joint 2
 
 # 이미지 파일로 저장
-ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --save-dir ~/ur_plots
+ros2 run ur5e_tools plot_ur_trajectory.py /tmp/ur5e_control_log.csv --save-dir ~/ur_plots
 
 # 통계만 출력
-ros2 run ur5e_rt_controller plot_ur_trajectory.py /tmp/ur5e_control_log.csv --stats
+ros2 run ur5e_tools plot_ur_trajectory.py /tmp/ur5e_control_log.csv --stats
 ```
 
 ### 핸드 UDP 테스트 (예제)
 
 ```bash
 # 사인파 테스트 데이터 전송 (500Hz)
-ros2 run ur5e_rt_controller hand_udp_sender_example.py
+ros2 run ur5e_tools hand_udp_sender_example.py
 # → 1) 사인파 (동적) / 2) 고정 포즈 (정적) 선택
 ```
 
@@ -642,7 +655,7 @@ logging:
   log_directory: "/tmp/ur5e_logs"
 ```
 
-### `config/hand_udp_receiver.yaml`
+### `ur5e_hand_udp/config/hand_udp_receiver.yaml`
 
 ```yaml
 udp:
@@ -654,11 +667,9 @@ publishing:
   rate: 100.0                # ROS2 퍼블리시 주파수 (Hz)
   topic: "/hand/joint_states"
 
-hand:
-  num_joints: 4
-  joint_names: [finger_1, finger_2, finger_3, finger_4]
-  min_position: 0.0
-  max_position: 1.0
+monitoring:
+  enable_statistics: true
+  statistics_period: 5.0     # 통계 출력 주기 (초)
 ```
 
 ---
@@ -671,8 +682,8 @@ hand:
 |------|------|--------|------|
 | `/joint_states` | `sensor_msgs/JointState` | UR 드라이버 | 6-DOF 관절 위치/속도/힘 |
 | `/target_joint_positions` | `std_msgs/Float64MultiArray` | 외부 노드 | 목표 관절 위치 (6개 값, rad) |
-| `/hand/joint_states` | `std_msgs/Float64MultiArray` | `hand_udp_receiver_node` | 핸드 상태 (4개 값) |
-| `/hand/command` | `std_msgs/Float64MultiArray` | 외부 노드 | 핸드 명령 (4개 값) |
+| `/hand/joint_states` | `std_msgs/Float64MultiArray` | `hand_udp_receiver_node` | 핸드 모터 위치 (**11개** 값) |
+| `/hand/command` | `std_msgs/Float64MultiArray` | 외부 노드 | 핸드 명령 (11개 값, 정규화 0.0–1.0) |
 
 ### 발행 토픽
 
@@ -680,9 +691,9 @@ hand:
 |------|------|--------|------|
 | `/forward_position_controller/commands` | `std_msgs/Float64MultiArray` | `custom_controller` | UR 위치 명령 (6개 값, rad) |
 | `/system/estop_status` | `std_msgs/Bool` | `custom_controller` | E-STOP 상태 (true=활성) |
-| `/joint_states` | `sensor_msgs/JointState` | `mujoco_simulator_node` | MuJoCo 시뮬 관절 위치/속도/**토크** |
-| `/hand/joint_states` | `std_msgs/Float64MultiArray` | `mujoco_simulator_node` | MuJoCo 핸드 상태 (100Hz) |
-| `/sim/status` | `std_msgs/Float64MultiArray` | `mujoco_simulator_node` | `[step_count, sim_time_sec, rtf, paused]` |
+| `/joint_states` | `sensor_msgs/JointState` | `mujoco_simulator_node` | MuJoCo 시뮬 관절 위치/속도 |
+| `/hand/joint_states` | `std_msgs/Float64MultiArray` | `mujoco_simulator_node` | MuJoCo 핸드 상태 — **11개** 모터 위치 (100Hz) |
+| `/sim/status` | `std_msgs/Float64MultiArray` | `mujoco_simulator_node` | `[step_count, sim_time_sec, rtf]` (1Hz) |
 
 ---
 
@@ -897,7 +908,7 @@ ros2 topic hz /hand/joint_states
 ros2 control list_controllers -v
 
 # 데이터 헬스 모니터 단독 실행
-ros2 run ur5e_rt_controller monitor_data_health.py
+ros2 run ur5e_tools monitor_data_health.py
 
 # 스레드 설정 확인 (v4.2.0+)
 PID=$(pgrep -f custom_controller)
