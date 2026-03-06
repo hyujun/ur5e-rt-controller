@@ -276,8 +276,10 @@ build_package() {
 
   local CMAKE_ARGS=()
   if [[ -n "$MJ_DIR" && -d "$MJ_DIR" ]]; then
-    CMAKE_ARGS+=("-Dmujoco_DIR=${MJ_DIR}/lib/cmake/mujoco")
-    info "MuJoCo cmake path: ${MJ_DIR}/lib/cmake/mujoco"
+    # MuJoCo binary release (tarball) does NOT include lib/cmake/mujoco/.
+    # Pass mujoco_ROOT so CMakeLists.txt can locate the .so and headers via find_library.
+    CMAKE_ARGS+=("-Dmujoco_ROOT=${MJ_DIR}")
+    info "MuJoCo root: ${MJ_DIR}"
   fi
 
   # Build order: ur5e_rt_base first (header-only, no deps), then the rest
