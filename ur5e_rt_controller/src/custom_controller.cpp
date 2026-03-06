@@ -56,6 +56,7 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <sys/mman.h>  // mlockall
+#include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <algorithm>
 #include <array>
@@ -164,7 +165,19 @@ class CustomController : public rclcpp::Node {
     declare_parameter("kp",              5.0);
     declare_parameter("kd",             0.5);
     declare_parameter("enable_logging",  true);
-    declare_parameter("log_dir",         "/tmp/ur5e_logging_data");
+    
+    // Dynamically resolve workspace logging dir using ament_index
+    std::string default_log_dir = "/tmp/ur5e_logging_data"; // fallback
+    try {
+      std::string share_dir = ament_index_cpp::get_package_share_directory("ur5e_rt_controller");
+      std::filesystem::path ws_path = std::filesystem::path(share_dir).parent_path().parent_path().parent_path().parent_path();
+      default_log_dir = (ws_path / "logging_data").string();
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "Could not resolve workspace via ament_index: %s. Using fallback: %s", 
+                  e.what(), default_log_dir.c_str());
+    }
+
+    declare_parameter("log_dir",         default_log_dir);
     declare_parameter("max_log_files",   10);
     declare_parameter("robot_timeout_ms", 100.0);
     declare_parameter("hand_timeout_ms",  200.0);

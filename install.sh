@@ -162,8 +162,9 @@ install_ur_driver() {
       ${ROS_PKG_PREFIX}-ur-description \
       ${ROS_PKG_PREFIX}-control-msgs \
       ${ROS_PKG_PREFIX}-industrial-msgs \
+      ${ROS_PKG_PREFIX}-rmw-cyclonedds-cpp \
       > /dev/null
-  success "UR robot driver installed"
+  success "UR robot driver and CycloneDDS installed"
 }
 
 # ── Pinocchio (all modes — needed by PinocchioController / ClikController) ────
@@ -326,13 +327,13 @@ install_rt_permissions() {
   if ! grep -q "@realtime.*rtprio" /etc/security/limits.conf; then
     echo "@realtime - rtprio 99" | sudo tee -a /etc/security/limits.conf > /dev/null
   fi
-  if ! grep -q "@realtime.*memlock" /etc/security/limits.conf; then
-    echo "@realtime - memlock unlimited" | sudo tee -a /etc/security/limits.conf > /dev/null
-  fi
+  # Force memlock unlimited by removing old @realtime memlock entries first
+  sudo sed -i '/@realtime.*memlock/d' /etc/security/limits.conf
+  echo "@realtime - memlock unlimited" | sudo tee -a /etc/security/limits.conf > /dev/null
 
   success "RT permissions configured (rtprio=99, memlock=unlimited)"
   warn "IMPORTANT: Log out and log back in for RT permissions to take effect"
-  warn "Verify with: ulimit -r  (should print 99)"
+  warn "Verify with: ulimit -l  (MUST be 'unlimited' to avoid RMW load errors with mlockall)"
 }
 
 # ── [방안 D] NIC IRQ affinity (robot + full) ────────────────────────────────
@@ -379,8 +380,8 @@ verify_installation() {
   info "Available executables (ur5e_hand_udp):"
   ros2 pkg executables ur5e_hand_udp 2>/dev/null || true
 
-  mkdir -p /tmp/ur5e_logs /tmp/ur5e_stats ~/ur_plots
-  success "Log directories ready (/tmp/ur5e_logs, /tmp/ur5e_stats, ~/ur_plots)"
+  mkdir -p "${WORKSPACE}/logging_data/stats" ~/ur_plots
+  success "Log directories ready (${WORKSPACE}/logging_data, ~/ur_plots)"
 }
 
 # ── Quick start summary ─────────────────────────────────────────────────────────
@@ -441,7 +442,7 @@ print_summary() {
       echo ""
       echo -e "  ${YELLOW}RT permissions: log out and back in, then verify:${NC}"
       echo "    ulimit -r   # should print 99"
-      echo "    ulimit -l   # should print unlimited"
+      echo "    ulimit -l   # should print unlimited (Required to prevent RMW load failure)"
       ;;
 
     full)
@@ -463,14 +464,14 @@ print_summary() {
       echo ""
       echo -e "  ${YELLOW}RT permissions: log out and back in, then verify:${NC}"
       echo "    ulimit -r   # should print 99"
-      echo "    ulimit -l   # should print unlimited"
+      echo "    ulimit -l   # should print unlimited (Required to prevent RMW load failure)"
       ;;
   esac
 
   echo ""
   echo -e "${CYAN}${BOLD}── Monitoring ──────────────────────────────────────────${NC}"
   echo "  ros2 run ur5e_tools monitor_data_health.py"
-  echo "  ros2 run ur5e_tools plot_ur_trajectory.py /tmp/ur5e_control_log.csv"
+  echo "  ros2 run ur5e_tools plot_ur_trajectory.py <workspace>/logging_data/ur5e_control_log_YYMMDD_HHMM.csv"
   echo "  ros2 run ur5e_tools motion_editor_gui.py"
   echo ""
   echo -e "${CYAN}${BOLD}── Documentation ───────────────────────────────────────${NC}"

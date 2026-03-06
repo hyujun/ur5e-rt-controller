@@ -43,7 +43,7 @@ custom_controller 노드를 수정 없이 그대로 실행합니다.
 연산 시간 로그 분석 (sync_step 실행 후):
   python3 -c "
   import pandas as pd
-  df = pd.read_csv('~/ur_ws/logging_data/ur5e_control_log_YYMMDD_HHMM.csv')
+  df = pd.read_csv('~/ros2_ws/ur5e_ws/logging_data/ur5e_control_log_YYMMDD_HHMM.csv')
   print(df['compute_time_us'].describe())
   print(f'P95: {df[\"compute_time_us\"].quantile(0.95):.1f} us')
   print(f'P99: {df[\"compute_time_us\"].quantile(0.99):.1f} us')
@@ -58,11 +58,17 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
     # ── Log directory (colcon workspace logging_data/) ────────────────────────
-    log_dir = os.path.expanduser('~/ur_ws/logging_data')
+    try:
+        share_dir = get_package_share_directory('ur5e_rt_controller')
+        ws_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(share_dir))))
+        log_dir = os.path.join(ws_dir, 'logging_data')
+    except Exception:
+        log_dir = os.path.expanduser('~/ros2_ws/ur5e_ws/logging_data')
 
     # ── Launch arguments ─────────────────────────────────────────────────────
     model_path_arg = DeclareLaunchArgument(
