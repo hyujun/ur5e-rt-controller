@@ -38,7 +38,7 @@ void MuJoCoSimulator::ReadSolverStats() noexcept {
   if (!data_) { return; }
   SolverStats s{};
   s.ncon = data_->ncon;
-  s.iter = data_->solver_iter;
+  s.iter = data_->solver_niter;
   // mjSolverStat[0] holds aggregate stats for the last solve.
   if (s.iter > 0) {
     s.improvement = static_cast<double>(data_->solver[0].improvement);
