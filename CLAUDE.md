@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run Commands
 
-**Prerequisites**: Ubuntu 22.04, ROS2 Humble, `realtime` group membership with `rtprio 99` / `memlock unlimited` in `/etc/security/limits.conf`.
+**Prerequisites**: Ubuntu 22.04 (ROS2 Humble) **or** Ubuntu 24.04 (ROS2 Jazzy), `realtime` group membership with `rtprio 99` / `memlock unlimited` in `/etc/security/limits.conf`.
 
 ```bash
 # Automated setup (installs deps, builds, sets RT permissions)
