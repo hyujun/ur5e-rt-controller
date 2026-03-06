@@ -18,10 +18,20 @@ class DataHealthMonitor(Node):
     def __init__(self):
         super().__init__('data_health_monitor')
         
+        import os
+        from ament_index_python.packages import get_package_share_directory
+        
+        try:
+            share_dir = get_package_share_directory('ur5e_rt_controller')
+            ws_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(share_dir))))
+            default_stats_dir = os.path.join(ws_dir, 'logging_data', 'stats')
+        except Exception:
+            default_stats_dir = os.path.expanduser('~/ros2_ws/ur5e_ws/logging_data/stats')
+
         # Parameters
         self.declare_parameter('check_rate', 10.0)
         self.declare_parameter('timeout_threshold', 0.2)
-        self.declare_parameter('stats_output_dir', '/tmp/ur5e_stats')
+        self.declare_parameter('stats_output_dir', default_stats_dir)
         self.declare_parameter('enable_stats', True)
         
         self.check_rate = self.get_parameter('check_rate').value

@@ -5,6 +5,7 @@
 #   E) CycloneDDS threads restricted to Core 0-1 via CYCLONEDDS_URI env var
 
 import os
+from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -23,7 +24,12 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 def generate_launch_description():
     # ── Log directory (colcon workspace logging_data/) ─────────────────────────
-    log_dir = os.path.expanduser('~/ur_ws/logging_data')
+    try:
+        share_dir = get_package_share_directory('ur5e_rt_controller')
+        ws_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(share_dir))))
+        log_dir = os.path.join(ws_dir, 'logging_data')
+    except Exception:
+        log_dir = os.path.expanduser('~/ros2_ws/ur5e_ws/logging_data')
 
     # ── Arguments ──────────────────────────────────────────────────────────────
     robot_ip_arg = DeclareLaunchArgument(
