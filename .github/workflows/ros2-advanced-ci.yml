@@ -193,9 +193,13 @@ jobs:
     name: Claude Code Review
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    permissions:
+      id-token: write       # required for OIDC authentication by claude-code-action
+      contents: read        # required to checkout the repository
+      pull-requests: read   # required to read PR context
     steps:
     - uses: actions/checkout@v4
-    
+
     - uses: anthropics/claude-code-action@v1
       env:
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
