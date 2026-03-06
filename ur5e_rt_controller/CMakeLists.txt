@@ -20,28 +20,19 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(ur_msgs REQUIRED)
-find_package(controller_manager REQUIRED)
-find_package(controller_interface REQUIRED)
-find_package(hardware_interface REQUIRED)
-find_package(pluginlib REQUIRED)
-find_package(realtime_tools REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(ur5e_rt_base REQUIRED)
 
 # ── custom_controller ──────────────────────────────────────────────────────────
 add_executable(custom_controller
   src/custom_controller.cpp
+  src/pd_controller.cpp
 )
 target_include_directories(custom_controller PRIVATE include)
 ament_target_dependencies(custom_controller
   rclcpp
   std_msgs
   sensor_msgs
-  ur_msgs
-  controller_interface
-  hardware_interface
-  realtime_tools
   ur5e_rt_base
 )
 target_link_libraries(custom_controller pinocchio::pinocchio)

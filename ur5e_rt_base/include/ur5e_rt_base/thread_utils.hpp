@@ -56,7 +56,7 @@ inline bool ApplyThreadConfig(const ThreadConfig& cfg) noexcept {
 
   // 3. Set thread name for debugging (max 15 chars + null terminator)
   char name_buf[16];
-  std::strncpy(name_buf, cfg.name.c_str(), sizeof(name_buf) - 1);
+  std::strncpy(name_buf, cfg.name, sizeof(name_buf) - 1);
   name_buf[sizeof(name_buf) - 1] = '\0';
   pthread_setname_np(pthread_self(), name_buf);
 
@@ -157,7 +157,7 @@ inline SystemThreadConfigs SelectThreadConfigs() noexcept {
             kLoggingConfig,   kAuxConfig};
   }
   return {kRtControlConfig4Core, kSensorConfig4Core, kUdpRecvConfig4Core,
-          kLoggingConfig4Core,   kLoggingConfig4Core};
+          kLoggingConfig4Core,   kAuxConfig4Core};
 }
 
 }  // namespace ur5e_rt_controller
