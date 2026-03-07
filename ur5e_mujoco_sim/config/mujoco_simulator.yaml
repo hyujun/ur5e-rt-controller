@@ -42,7 +42,7 @@ mujoco_simulator:
     #   1.0   → real-time (RTF = 1× — matches wall clock)
     #   10.0  → 10× real time (10 simulated seconds per wall second)
     #   100.0 → 100× real time
-    max_rtf: 1.0
+    max_rtf: 2.0
 
     # ── Viewer ───────────────────────────────────────────────────────────────
     # Open a GLFW window for 3D visualisation.

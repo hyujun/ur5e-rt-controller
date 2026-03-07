@@ -66,52 +66,57 @@ from ament_index_python.packages import get_package_share_directory
 
 def launch_setup(context, *args, **kwargs):
     """Setup function executed with launch context for conditional parameter loading."""
-    
+
     # ── Log directory (colcon workspace logging_data/) ────────────────────────
     try:
         share_dir = get_package_share_directory('ur5e_rt_controller')
-        ws_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(share_dir))))
+        ws_dir = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.dirname(share_dir))))
         log_dir = os.path.join(ws_dir, 'logging_data')
     except Exception:
         log_dir = os.path.expanduser('~/ros2_ws/ur5e_ws/logging_data')
 
     # ── Package paths ─────────────────────────────────────────────────────────
-    pkg_sim  = FindPackageShare('ur5e_mujoco_sim')
+    pkg_sim = FindPackageShare('ur5e_mujoco_sim')
     pkg_ctrl = FindPackageShare('ur5e_rt_controller')
 
-    sim_config  = PathJoinSubstitution([pkg_sim,  'config', 'mujoco_simulator.yaml'])
-    ctrl_config = PathJoinSubstitution([pkg_ctrl, 'config', 'ur5e_rt_controller.yaml'])
+    sim_config = PathJoinSubstitution(
+        [pkg_sim,  'config', 'mujoco_simulator.yaml'])
+    ctrl_config = PathJoinSubstitution(
+        [pkg_ctrl, 'config', 'ur5e_rt_controller.yaml'])
 
     # ── Build simulator parameters (YAML first, then conditional overrides) ───
     sim_params = [sim_config]
     sim_overrides = {}
-    
+
     # Check each launch argument - only add to overrides if explicitly provided
     model_path = LaunchConfiguration('model_path').perform(context)
     if model_path != '':
         sim_overrides['model_path'] = model_path
-    
+
     sim_mode = LaunchConfiguration('sim_mode').perform(context)
     if sim_mode != '':
         sim_overrides['sim_mode'] = sim_mode
-    
+
     enable_viewer = LaunchConfiguration('enable_viewer').perform(context)
     if enable_viewer != '':
         # Convert string to bool
-        sim_overrides['enable_viewer'] = enable_viewer.lower() in ('true', '1', 'yes')
-    
-    publish_decimation = LaunchConfiguration('publish_decimation').perform(context)
+        sim_overrides['enable_viewer'] = enable_viewer.lower() in (
+            'true', '1', 'yes')
+
+    publish_decimation = LaunchConfiguration(
+        'publish_decimation').perform(context)
     if publish_decimation != '':
         sim_overrides['publish_decimation'] = int(publish_decimation)
-    
+
     sync_timeout_ms = LaunchConfiguration('sync_timeout_ms').perform(context)
     if sync_timeout_ms != '':
         sim_overrides['sync_timeout_ms'] = float(sync_timeout_ms)
-    
+
     max_rtf = LaunchConfiguration('max_rtf').perform(context)
     if max_rtf != '':
         sim_overrides['max_rtf'] = float(max_rtf)
-    
+
     # Add overrides only if any were provided
     if sim_overrides:
         sim_params.append(sim_overrides)
@@ -119,18 +124,18 @@ def launch_setup(context, *args, **kwargs):
     # ── Build controller parameters (YAML + overrides + launch args) ──────────
     ctrl_params = [ctrl_config, sim_config]
     ctrl_overrides = {}
-    
+
     kp = LaunchConfiguration('kp').perform(context)
     if kp != '':
         ctrl_overrides['kp'] = float(kp)
-    
+
     kd = LaunchConfiguration('kd').perform(context)
     if kd != '':
         ctrl_overrides['kd'] = float(kd)
-    
+
     # Always set log_dir
     ctrl_overrides['log_dir'] = log_dir
-    
+
     if ctrl_overrides:
         ctrl_params.append(ctrl_overrides)
 
